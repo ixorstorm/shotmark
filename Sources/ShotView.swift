@@ -381,7 +381,7 @@ final class ShotView: NSView {
         switch event.keyCode {
         case 53:  // Esc
             delegate?.shotView(self, didFinish: nil, action: nil)
-        case 36:  // Return = 复制
+        case 36, 49:  // Return / Space = 复制
             finish(.copy)
         case 6 where cmd:  // ⌘Z
             if !annotations.isEmpty { annotations.removeLast(); needsDisplay = true }
