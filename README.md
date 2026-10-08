@@ -74,6 +74,20 @@ Sources/
 - **全局热键用 Carbon 而非 pynput/CGEventTap**：`RegisterEventHotKey` 不需要辅助功能权限，进程后台挂着也能收。
 - **多屏**：每屏一个 borderless 窗口（`CGShieldingWindowLevel` + `canJoinAllSpaces`），各自捕获各自标注，任一屏完成动作即全部关闭。
 
+## 图标
+
+`make icon` 由 `scripts/gen-icon.swift` 矢量直绘 13 张 PNG（深蓝渐变圆角底 + 白色取景框四角 + 手绘红圈，逐尺寸单独渲染保证 16px 清晰）→ `iconutil` 出 `AppIcon.icns` → 打进 `Contents/Resources/` 并随签名封装。改设计改 `gen-icon.swift` 里 `drawIcon()` 即可。
+
+## 屏幕录制权限排障（2026-10-08 实测踩过的坑，按序排查）
+
+1. **「截图失败」弹窗但设置里开关是开的** → 那是**旧签名身份的僵尸授权**。TCC 按签名身份记账：ad-hoc 签名每次重编 cdhash 都变、授权即失效；且设置页还继续显示旧开关，极具迷惑性。
+   - 根治：本仓库已用自签名证书「ShotMark Local Signing」（`scripts/make-signing-cert.sh`，跑一次即可），TCC 按 `identifier + 签名身份` 记忆，**重编不失效**。
+   - 清僵尸记录：`tccutil reset ScreenCapture dev.shotmark`（注意服务名是 `ScreenCapture`，`ScreenCaptureKit` 不是合法服务名）。
+2. **刚在弹窗里点了允许，还是失败**（`SCStreamErrorDomain -3801`）→ 授权**对正在运行的进程不生效**，必须完全退出再打开（菜单栏取景器图标 → 退出 ShotMark → 重新打开）。App 现在能识别 -3801 并直接提示这个操作。
+3. **进程路径变了**（如从 `dev/` 旧目录跑的残留进程）→ 授权跟着旧路径/旧 cdhash 走了。先 `pgrep -fl ShotMark` 确认跑的是 `~/Applications/` 里的这份。
+
+排查工具：`open ~/Applications/ShotMark.app --args --capture-test`（以真实 App 身份跑一次捕获，结果写 `$TMPDIR/shotmark-capture-test.log`，含 preflight 状态与真实错误码）。
+
 ## 已知限制 / TODO
 
 - 无序号标注、钉图不可二次编辑、文字提交后不可移动（重做=⌘Z 重画）。
@@ -85,7 +99,8 @@ Sources/
 - `make`：swiftc 6.3.2（CLT，无 Xcode 全量）一次通过。
 - `make selftest`：export.png 六种标注全部正确渲染（椭圆/箭头/矩形/画笔/马赛克/文字），Retina 2x 输出；view.png 完整界面（蒙层/镂空/手柄/尺寸标签/工具栏选中态/色板/线宽预览/动作键）渲染正确。
 - `open ShotMark.app`：进程存活、后台进程名单可见 `ShotMark`、`pkill` 后 0 残留。
-- 真机截屏链路（屏幕录制权限 + 真实热键）待用户授权后实测。
+- **真机截屏链路已实测通过**：`--capture-test` 以 App 真实身份双屏捕获 OK（3840×2160 + 3024×1964），用户热键实机确认可用（「好像好了」）。
+- 权限链路排障记录见上节（僵尸授权 / -3801 重开生效 / 自签名证书根治）。
 
 ## 项目沿革
 

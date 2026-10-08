@@ -43,6 +43,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let screens = NSScreen.screens
         Task { @MainActor in
             var ok = false
+            var tccDenied = false
+            var firstError = ""
             for screen in screens {
                 do {
                     let cg = try await Capture.grab(screen: screen)
@@ -50,13 +52,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     presentOverlay(screen: screen, image: img)
                     ok = true
                 } catch {
-                    fputs("[ShotMark] 捕获失败: \(error.localizedDescription)\n", stderr)
+                    let nserr = error as NSError
+                    fputs("[ShotMark] 捕获失败: \(nserr.domain) \(nserr.code) \(nserr.localizedDescription)\n", stderr)
+                    if nserr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", nserr.code == -3801 {
+                        tccDenied = true
+                    }
+                    if firstError.isEmpty { firstError = "\(nserr.code) \(nserr.localizedDescription)" }
                 }
             }
             if ok {
                 NSApp.activate(ignoringOtherApps: true)
+            } else if tccDenied {
+                alert("屏幕录制权限未生效",
+                      "系统已记录授权，但当前进程还没生效。请点菜单栏取景器图标 →「退出 ShotMark」，再重新打开，然后按 ⌃⇧A。")
             } else {
-                alert("截图失败", "未能获得屏幕内容，请检查屏幕录制权限后重试。")
+                alert("截图失败", "未能获得屏幕内容（\(firstError)）。请检查屏幕录制权限后重试。")
             }
         }
     }
