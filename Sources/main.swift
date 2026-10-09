@@ -26,6 +26,10 @@ final class CaptureTestDelegate: NSObject, NSApplicationDelegate {
                 do {
                     let cg = try await Capture.grab(screen: s)
                     self.log("OK \(cg.width)x\(cg.height)")
+                    let img = NSImage(cgImage: cg, size: s.frame.size)
+                    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-capture-\(ok).png")
+                    Render.writePNG(img, to: url)
+                    self.log("saved -> \(url.path)")
                     ok += 1
                 } catch {
                     self.log("FAIL: \(error)")

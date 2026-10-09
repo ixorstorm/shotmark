@@ -37,17 +37,35 @@ enum Capture {
         Task { _ = try? await content() }
     }
 
+    /// 绕过缓存拉新鲜清单（显示器过渡期/兜底重试用）
+    static func freshContent() async throws -> SCShareableContent {
+        let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        contentCache = (c, Date())
+        return c
+    }
+
+    static func invalidateContentCache() { contentCache = nil }
+
     static func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
         screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
     }
 
+    /// 找 SCDisplay：displayID 优先，失配（显示器切换过渡期实测会发生）按分辨率几何兜底
+    static func findDisplay(for screen: NSScreen, in content: SCShareableContent) -> SCDisplay? {
+        if let id = displayID(for: screen),
+           let d = content.displays.first(where: { $0.displayID == id }) {
+            return d
+        }
+        let w = Int(screen.frame.width), h = Int(screen.frame.height)
+        return content.displays.first(where: { $0.width == w && $0.height == h })
+    }
+
     static func grab(screen: NSScreen) async throws -> CGImage {
         let t0 = Date()
-        let content = try await content()
+        let content = try await freshContent()   // 热键路径不用缓存：过渡期缓存清单里的 SCDisplay 会失配
         let t1 = Date()
         fputs("[timing] ShareableContent \(String(format: "%.0f", t1.timeIntervalSince(t0)*1000))ms\n", stderr)
-        guard let id = displayID(for: screen) else { throw CaptureError.noDisplayID }
-        guard let display = content.displays.first(where: { $0.displayID == id }) else {
+        guard let display = findDisplay(for: screen, in: content) else {
             throw CaptureError.displayNotFound
         }
         let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -63,11 +81,14 @@ enum Capture {
 
     /// 只抓某块区域（滚动截屏用）。regionPts 为屏内点坐标（AppKit y-up，原点左下）。
     static func grabRegion(screen: NSScreen, regionPts: CGRect) async throws -> CGImage {
-        let content = try await content()
-        guard let id = displayID(for: screen) else { throw CaptureError.noDisplayID }
-        guard let display = content.displays.first(where: { $0.displayID == id }) else {
-            throw CaptureError.displayNotFound
+        var content = try await content()
+        var display = findDisplay(for: screen, in: content)
+        if display == nil {
+            invalidateContentCache()
+            content = try await freshContent()
+            display = findDisplay(for: screen, in: content)
         }
+        guard let display else { throw CaptureError.displayNotFound }
         // 排除本进程自己的窗口（边框提示窗/实时预览窗），防止被拼进长图
         let ourPID = ProcessInfo.processInfo.processIdentifier
         let excluded = content.windows.filter { $0.owningApplication?.processID == ourPID }
