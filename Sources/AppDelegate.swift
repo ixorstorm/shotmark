@@ -24,6 +24,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem?.button?.title = "⚠️"
         }
 
+        if CommandLine.arguments.contains("--toast-test") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.showToast("滚动截屏完成：已复制到剪贴板（3160×8920px）", saveImage: NSImage(size: NSSize(width: 10, height: 10)))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { NSApp.terminate(nil) }
+            return
+        }
+
         if CommandLine.arguments.contains("--overlay-test") {
             // 完整走热键路径（并行抓图 + 覆盖层），把抓到的图落盘后退出
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.startCapture() }
@@ -258,8 +266,14 @@ extension AppDelegate: ShotViewDelegate {
     private func showToast(_ text: String, saveImage img: NSImage? = nil) {
         toastWin?.close()
         toastImage = img
-        let w: CGFloat = 560, h: CGFloat = 44
         guard let screen = NSScreen.main else { return }
+        // 按文字实测尺寸排版：label 水平垂直居中，「保存」按钮在右不占文字的中线
+        let font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let ts = NSString(string: text).size(withAttributes: [.font: font])
+        let labelW = ceil(ts.width), labelH = ceil(ts.height)
+        let pad: CGFloat = 16, gap: CGFloat = 10, btnW: CGFloat = 64, btnH: CGFloat = 26
+        let w = pad * 2 + labelW + (img != nil ? gap + btnW : 0)
+        let h = max(44, labelH + 22)
         let win = NSWindow(contentRect: NSRect(x: screen.frame.midX - w / 2,
                                                y: screen.frame.maxY - 110,
                                                width: w, height: h),
@@ -272,20 +286,18 @@ extension AppDelegate: ShotViewDelegate {
         bg.wantsLayer = true
         bg.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.92).cgColor
         bg.layer?.cornerRadius = 10
-        let label = NSTextField(wrappingLabelWithString: text)
-        label.alignment = .center
+        let label = NSTextField(labelWithString: text)
+        label.font = font
         label.textColor = .white
-        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        label.alignment = .center
+        label.frame = NSRect(x: pad, y: (h - labelH) / 2 - 1, width: labelW, height: labelH + 2)
+        bg.addSubview(label)
         if img != nil {
-            label.frame = NSRect(x: 12, y: 6, width: w - 96, height: h - 12)
             let btn = NSButton(title: "保存", target: self, action: #selector(toastSaveClicked))
             btn.bezelStyle = .rounded
-            btn.frame = NSRect(x: w - 76, y: 8, width: 64, height: 28)
+            btn.frame = NSRect(x: pad + labelW + gap, y: (h - btnH) / 2, width: btnW, height: btnH)
             bg.addSubview(btn)
-        } else {
-            label.frame = NSRect(x: 12, y: 6, width: w - 24, height: h - 12)
         }
-        bg.addSubview(label)
         win.contentView = bg
         win.orderFrontRegardless()
         toastWin = win
