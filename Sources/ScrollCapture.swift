@@ -246,16 +246,16 @@ final class ScrollCaptureSession: NSObject {
         var fwdMatch: ScrollDeltaDetail?
         if let fwd = matchForward(prev: prev, new: new, margin: margin) {
             let tex = textureScore(prev: prev, new: new, dy: fwd.dy)
-            if fwd.overlap >= 24, tex >= 24 {
-                fwdMatch = ScrollDeltaDetail(dy: fwd.dy, overlap: fwd.overlap, tex: tex)
+            if tex >= 24 {
+                fwdMatch = ScrollDeltaDetail(dy: fwd.dy, overlap: fwd.matched, tex: tex)
             }
         }
         var bwdMatch: ScrollDeltaDetail?
         if let bwd = matchBackward(prev: prev, new: new, margin: margin) {
             // 反向重叠区 = new 的下部 vs prev 的上部，换算成 textureScore 的参数视角
             let tex = textureScore(prev: new, new: prev, dy: bwd.prependRows)
-            if bwd.overlap >= 24, tex >= 24 {
-                bwdMatch = ScrollDeltaDetail(dy: -bwd.prependRows, overlap: bwd.overlap, tex: tex)
+            if tex >= 24 {
+                bwdMatch = ScrollDeltaDetail(dy: -bwd.prependRows, overlap: bwd.matched, tex: tex)
             }
         }
         switch (fwdMatch, bwdMatch) {
@@ -270,57 +270,93 @@ final class ScrollCaptureSession: NSObject {
         scrollDeltaDetailed(prev: prev, new: new).dy
     }
 
-    /// 正向（内容上移/下滚）：new 的上部逐行对齐 prev 的下部，找最长连续精确匹配 run。
-    /// 从满重叠往下扫，>` 严格大于「保证同分取更大重叠（= 更小位移）」。
-    private static func matchForward(prev: Frame, new: Frame, margin: Int) -> (dy: Int, overlap: Int)? {
+    /// 正向（内容上移/下滚）：逐 dy 扫描，重叠区逐行比对，允许 ≤2.5% 断行预算
+    ///（光标闪烁/抗锯齿噪声会断 run，断行预算把它们当噪声吞掉；
+    /// 而幻影匹配是大面积错位，断行远超预算）。采纳条件：断行不超预算且匹配行 ≥24。
+    private static func matchForward(prev: Frame, new: Frame, margin: Int) -> (dy: Int, matched: Int, overlap: Int)? {
         let H = prev.h
-        var bestCount = 0, bestY = -1
-        let matchLimit = H / 2
-        var yNew = H - 1
-        while yNew >= 0, bestCount < matchLimit {
-            var count = 0
-            while yNew - count >= 0,
-                  rowsEqual(prev, rowA: H - 1 - count, new, rowB: yNew - count, margin: margin) {
-                count += 1
+        let maxDelta = H - 60
+        var best: (dy: Int, matched: Int, overlap: Int)?
+        var dy = 0
+        while dy <= maxDelta {
+            let ov = H - dy
+            let failBudget = max(2, ov / 40)
+            var matched = 0, failed = 0
+            var r = 0
+            while r < ov {
+                if rowsEqual(prev, rowA: dy + r, new, rowB: r, margin: margin) {
+                    matched += 1
+                } else {
+                    failed += 1
+                    if failed > failBudget { break }
+                }
+                r += 1
             }
-            // 铁律：run 必须触及 new 的顶边（允许 ≤8 行缝隙给接缝噪声）——
-            // 悬浮在中间的白行 run 是幻影匹配（白底页实测：dy=65/0 的假 run 都活不过这条）
-            if count > bestCount, yNew - count < 8 { bestCount = count; bestY = yNew }
-            yNew -= 1
+            if failed <= failBudget, matched >= 24,
+               best == nil || matched > best!.matched || (matched == best!.matched && dy < best!.dy) {
+                best = (dy, matched, ov)
+            }
+            dy += 1
         }
-        guard bestCount > 0 else { return nil }
-        return (dy: H - 1 - bestY, overlap: bestCount)
+        return best
     }
 
-    /// 反向（内容下移/上滚）：new 的下部逐行对齐 prev 的上部。
-    private static func matchBackward(prev: Frame, new: Frame, margin: Int) -> (prependRows: Int, overlap: Int)? {
+    /// 反向（内容下移/上滚）：重叠区 = prev 的上部 vs new 的下部。
+    private static func matchBackward(prev: Frame, new: Frame, margin: Int) -> (prependRows: Int, matched: Int, overlap: Int)? {
         let H = prev.h
-        var bestCount = 0, bestStart = -1
-        let matchLimit = H / 2
-        var yNew = 0
-        while yNew < H, bestCount < matchLimit {
-            var count = 0
-            while yNew + count < H,
-                  rowsEqual(prev, rowA: count, new, rowB: yNew + count, margin: margin) {
-                count += 1
+        let maxDelta = H - 60
+        var best: (prependRows: Int, matched: Int, overlap: Int)?
+        var prep = 0
+        while prep <= maxDelta {
+            let ov = H - prep
+            let failBudget = max(2, ov / 40)
+            var matched = 0, failed = 0
+            var r = 0
+            while r < ov {
+                if rowsEqual(prev, rowA: r, new, rowB: prep + r, margin: margin) {
+                    matched += 1
+                } else {
+                    failed += 1
+                    if failed > failBudget { break }
+                }
+                r += 1
             }
-            // 对称铁律：run 必须触及 new 的底边
-            if count > bestCount, yNew + count > H - 8 { bestCount = count; bestStart = yNew }
-            yNew += 1
+            if failed <= failBudget, matched >= 24,
+               best == nil || matched > best!.matched || (matched == best!.matched && prep < best!.prependRows) {
+                best = (prep, matched, ov)
+            }
+            prep += 1
         }
-        guard bestCount > 0 else { return nil }
-        return (prependRows: bestStart, overlap: bestCount)
+        return best
     }
 
-    /// 行级精确比较（memcmp，左右各让 margin 像素）——逐字节相等才算匹配行
+    /// 行级近似精确比较：memcmp 太脆——SCK 对分数像素的 sourceRect（鼠标拖出来的选区）
+    /// 会重采样，整行几乎每行都差几个字节，逐字节相等全灭（实测 overlap=0 恒 nil）。
+    /// 规则：99.5% 像素逐通道 |Δ| ≤ 12 才算匹配行（抗合成噪声/光标闪烁，防幻影绰绰有余：
+    /// 幻影行是大面积错位，坏像素比例远超 0.5%）。
     private static func rowsEqual(_ a: Frame, rowA: Int, _ b: Frame, rowB: Int, margin: Int) -> Bool {
         let w = a.w - margin * 2
         guard w > 0 else { return false }
         let offA = rowA * a.bpr + margin * 4
         let offB = rowB * b.bpr + margin * 4
+        let maxBad = max(2, w / 200)
         return a.data.withUnsafeBytes { pa in
             b.data.withUnsafeBytes { pb in
-                memcmp(pa.baseAddress! + offA, pb.baseAddress! + offB, w * 4) == 0
+                let p = pa.baseAddress!.advanced(by: offA).bindMemory(to: UInt8.self, capacity: w * 4)
+                let q = pb.baseAddress!.advanced(by: offB).bindMemory(to: UInt8.self, capacity: w * 4)
+                var bad = 0
+                var px = 0
+                while px < w {
+                    let i = px * 4
+                    if abs(Int(p[i]) - Int(q[i])) > 12
+                        || abs(Int(p[i + 1]) - Int(q[i + 1])) > 12
+                        || abs(Int(p[i + 2]) - Int(q[i + 2])) > 12 {
+                        bad += 1
+                        if bad > maxBad { return false }
+                    }
+                    px += 1
+                }
+                return true
             }
         }
     }

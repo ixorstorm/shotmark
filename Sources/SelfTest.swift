@@ -83,6 +83,27 @@ enum SelfTest {
         let phantom = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(1100))
         let p3 = phantom.dy == nil
         print("whitematch: 大跳变零重叠 dy=\(phantom.dy.map(String.init) ?? "nil") -> \(p3 ? "PASS" : "FAIL")")
+        // 噪声回归（SCK 分数像素 sourceRect 重采样/光标闪烁）：帧内撒 ±8 噪声点，仍应匹配 dy=87
+        guard let noisyRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: FH,
+                                              bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                              isPlanar: false, colorSpaceName: .deviceRGB,
+                                              bytesPerRow: 0, bitsPerPixel: 0),
+              let nctx = NSGraphicsContext(bitmapImageRep: noisyRep) else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = nctx
+        NSImage(cgImage: frame(87).cg, size: NSSize(width: W, height: FH)).draw(in: NSRect(x: 0, y: 0, width: W, height: FH))
+        NSColor.gray.setFill()
+        var rng: UInt64 = 42
+        for _ in 0..<200 {   // 撒 200 个 1px 噪声点（＜0.5% 行像素预算内）
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            let nx = Int(rng >> 33) % W, ny = Int(rng >> 11) % FH
+            NSRect(x: nx, y: ny, width: 1, height: 1).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        let noisy = ScrollCaptureSession.Frame(noisyRep.cgImage!)
+        let noisyMatch = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: noisy)
+        let p4 = noisyMatch.dy == 87
+        print("whitematch: 噪声帧 dy=\(noisyMatch.dy.map(String.init) ?? "nil") tex=\(noisyMatch.tex) -> \(p4 ? "PASS" : "FAIL")")
     }
 
     /// 造 1600px 长图，用滑动窗口模拟滚动帧，验证匹配 + 拼接还原
