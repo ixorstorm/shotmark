@@ -74,6 +74,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             closeOverlays()
             return
         }
+        // 锁屏时 SCK 只能抓到壁纸（锁屏盖住所有窗口是 macOS 隐私设计）——直接不弹
+        if let d = CGSessionCopyCurrentDictionary() as? [String: Any],
+           (d["CGSSessionScreenIsLocked"] as? Bool) == true {
+            fputs("[ShotMark] 屏幕已锁定，跳过截图（锁屏下只能抓到壁纸）\n", stderr)
+            return
+        }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             alert("需要「屏幕录制」权限",
