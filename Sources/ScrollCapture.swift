@@ -45,8 +45,10 @@ final class ScrollCaptureSession: NSObject {
     private weak var previewImgView: NSImageView?
     private var lastPreviewAt = Date.distantPast
     private var timer: Timer?
+    private var tickInterval: Double = 0.15   // 速度自适应：滚得快就抓得快
     private var capturing = false
     private var hotKeyRefs: [EventHotKeyRef?] = []
+    private var nilStreak = 0                  // 连续配不上且内容在变的拍数（失速预警）
 
     private var firstFrame: Frame?
     private var lastFrame: Frame?
@@ -77,9 +79,7 @@ final class ScrollCaptureSession: NSObject {
             guard let self = self else { return }
             if code == 53 { self.cancel() } else { self.finish() }
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
+        scheduleTimer(0.15)
         tick()
     }
 
@@ -113,6 +113,25 @@ final class ScrollCaptureSession: NSObject {
     }
 
     // MARK: - 抓帧
+
+    private func scheduleTimer(_ interval: Double) {
+        guard interval != tickInterval else { return }
+        tickInterval = interval
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+    }
+
+    /// 位移大 = 用户在快滚 → 抓帧提速到 70ms；慢下来回 150ms。
+    /// 否则惯性滚动的单拍位移会超出匹配量程（maxDelta），永失衔接（静默丢内容）。
+    private func adaptTickRate(matchedDy: Int, frameH: Int) {
+        if matchedDy > frameH / 4 {
+            scheduleTimer(0.07)
+        } else if matchedDy < frameH / 8 {
+            scheduleTimer(0.15)
+        }
+    }
 
     private func tick() {
         guard !capturing else { return }
@@ -148,9 +167,17 @@ final class ScrollCaptureSession: NSObject {
         let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
         debugDys.append(detail.dy)
         guard let dy = detail.dy else {
+            // 失速预警：连续 5 拍配不上且内容确实在变（dy=0 处误差大）→ 提示回滚衔接
+            let staticErr = Self.stripError(prev: prev, new: nf, dy: 0)
+            nilStreak = staticErr > 8 ? nilStreak + 1 : 0
+            borderView?.warning = nilStreak >= 5
+                ? "滚动过快，衔接可能丢失 · 建议回滚到蓝框内最后画面再慢滚"
+                : nil
             debugLog(detail: detail, appended: 0)
             return   // 未匹配（滚动过快/低纹理）：保持 prev，下拍重试
         }
+        nilStreak = 0
+        borderView?.warning = nil
         let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
         var appended = 0
         if dy >= 0 {
@@ -181,6 +208,7 @@ final class ScrollCaptureSession: NSObject {
             borderView?.progress = capturedBottom - capturedTop
             updatePreview()
         }
+        adaptTickRate(matchedDy: abs(dy), frameH: nf.h)
         debugLog(detail: detail, appended: appended)
         lastPos = p
         lastFrame = nf
@@ -453,12 +481,16 @@ final class ScrollBorderView: NSView {
     var progress: Int = 0 {
         didSet { needsDisplay = true }
     }
+    /// 失速预警文案（非 nil 时提示条变红）
+    var warning: String? {
+        didSet { needsDisplay = true }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         // 顶部提示条
-        let hint = progress > 0
+        let hint = warning ?? (progress > 0
             ? "滚动截屏中 · 已拼 \(progress)px · 空格/回车 完成 · Esc 取消"
-            : "滚动截屏进行中 · 滚动滚轮 · 空格/回车 完成 · Esc 取消"
+            : "滚动截屏进行中 · 滚动滚轮 · 空格/回车 完成 · Esc 取消")
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .medium),
             .foregroundColor: NSColor.white,
@@ -466,7 +498,8 @@ final class ScrollBorderView: NSView {
         let ts = NSString(string: hint).size(withAttributes: attrs)
         let bar = NSRect(x: bounds.midX - ts.width / 2 - 10, y: bounds.maxY - 30,
                          width: ts.width + 20, height: 24)
-        NSColor(white: 0.1, alpha: 0.9).setFill()
+        (warning == nil ? NSColor(white: 0.1, alpha: 0.9)
+                        : NSColor(srgbRed: 0.75, green: 0.2, blue: 0.18, alpha: 0.95)).setFill()
         NSBezierPath(roundedRect: bar, xRadius: 7, yRadius: 7).fill()
         NSString(string: hint).draw(at: CGPoint(x: bar.minX + 10, y: bar.minY + 5), withAttributes: attrs)
         // 虚线边框

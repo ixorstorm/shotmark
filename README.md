@@ -24,7 +24,7 @@
 | 复制到剪贴板 | ✅ ✓ 按钮 / 回车 / ⌘C |
 | 保存 | ✅ 存 `~/Pictures/ShotMark/ShotMark-<时间戳>.png` 并在 Finder 中 Reveal |
 | 钉在屏幕上 | ✅ 浮动小窗（可关可缩） |
-| **滚动截屏** | ✅ 选区后点「回卷轴」图标：边框悬停提示 → 滚轮滚动 → **实时拼接预览** → 空格/回车完成，自动复制 + 保存；Esc 取消；**双向滚动拼接（上滚越过起点自动前插顶部）+ 手滑去重不误拼** |
+| **滚动截屏** | ✅ 选区后点「回卷轴」图标：边框悬停提示 → 滚轮滚动 → **实时拼接预览** → 空格/回车完成，复制进剪贴板（toast 上可自选「保存」）；Esc 取消；**双向滚动拼接（上滚越过起点自动前插顶部）+ 手滑去重不误拼** |
 | 取消 | ✅ ✕ 按钮 / Esc |
 | 序号标注、钉图二次编辑 | ✗ 未做（见 TODO） |
 
@@ -73,7 +73,7 @@ Sources/
 
 - **视图与导出共用一套标注绘制代码**（`Render.draw`）：导出时给 context 套 `translate(-sel.origin) → scale(×2)` 仿射，Retina 下导出的就是 2x 像素图。
 - **马赛克**：把选区对应底图块画进 1/9 大小的临时 rep，再 `imageInterpolation = .none` 放大回来。
-- **滚动截屏拼接**（v5，模糊匹配 + 幻影五闸门）：`SCStreamConfiguration.sourceRect` 只抓选区（150ms/拍），`SCContentFilter(excludingWindows:)` + 窗口 `sharingType=.none` 双保险让边框/预览窗**对截屏隐身**。匹配器 = 逐 dy 扫重叠区平均像素差（粗扫步长 8 + 精扫 ±1），**五道幻影闸门全部由真实事故反推**：① 纹理闸门（候选先按重叠区高对比像素双侧取小 ≥48 过滤，防全白 err=0 假对齐与单侧字形出血）② 边界否决（贴 maxDelta 的候选必须 err<1.5，防 dy=660 顶边界擦边幻影）③ 恒要求 fineErr < 0.6×secondErr 显著优于次优（防渐变/平坦地形假匹配，无「近乎全等」豁免）④ fineErr < 5.0 阈值 ⑤ 最小重叠 25%（防小重叠白色口袋幻影）。**双向竞争按重叠行数**（噪声帧上反向幻影 err 更低是常态，err 竞争会被噪声带偏）。**水位线双向去重**：下滚后插、上滚前插、已覆盖区不重复。调研参照：[ShareX ScrollingCaptureManager 源码](https://raw.githubusercontent.com/ShareX/ShareX/master/ShareX.ScreenCaptureLib/ScrollingCaptureManager.cs)、[Android 长截图 tile 匹配](https://gitlab.e.foundation/e/os/android_frameworks_base/-/commit/be15324c5d5be2130d9dbad583848d7fa50223bc)、[OpenCV 运动分析文档](https://docs.opencv.org/4.13.0/d7/df3/group__imgproc__motion.html)。**实时预览**：0.8s 节流浮动窗随拼接长大。拼接用 `NSImage.draw`（AppKit y-up 语义）——**不要用 `CGContext.draw(cgImage)`，bitmap context 里方向语义不可靠**。匹配器弯路存档：v3 模糊（幻影）→ v4 近似精确（SCK 分数像素重采样致恒 nil）→ v5 模糊+五闸门（平衡点，测试用例库兜底）。
+- **滚动截屏拼接**（v5，模糊匹配 + 幻影五闸门 + 速度自适应抓帧）：`SCStreamConfiguration.sourceRect` 只抓选区（150ms/拍），`SCContentFilter(excludingWindows:)` + 窗口 `sharingType=.none` 双保险让边框/预览窗**对截屏隐身**。匹配器 = 逐 dy 扫重叠区平均像素差（粗扫步长 8 + 精扫 ±1），**五道幻影闸门全部由真实事故反推**：① 纹理闸门（候选先按重叠区高对比像素双侧取小 ≥48 过滤，防全白 err=0 假对齐与单侧字形出血）② 边界否决（贴 maxDelta 的候选必须 err<1.5，防 dy=660 顶边界擦边幻影）③ 恒要求 fineErr < 0.6×secondErr 显著优于次优（防渐变/平坦地形假匹配，无「近乎全等」豁免）④ fineErr < 5.0 阈值 ⑤ 最小重叠 25%（防小重叠白色口袋幻影）。**双向竞争按重叠行数**（噪声帧上反向幻影 err 更低是常态，err 竞争会被噪声带偏）。**水位线双向去重**：下滚后插、上滚前插、已覆盖区不重复。调研参照：[ShareX ScrollingCaptureManager 源码](https://raw.githubusercontent.com/ShareX/ShareX/master/ShareX.ScreenCaptureLib/ScrollingCaptureManager.cs)、[Android 长截图 tile 匹配](https://gitlab.e.foundation/e/os/android_frameworks_base/-/commit/be15324c5d5be2130d9dbad583848d7fa50223bc)、[OpenCV 运动分析文档](https://docs.opencv.org/4.13.0/d7/df3/group__imgproc__motion.html)。**实时预览**：0.8s 节流浮动窗随拼接长大。拼接用 `NSImage.draw`（AppKit y-up 语义）——**不要用 `CGContext.draw(cgImage)`，bitmap context 里方向语义不可靠**。匹配器弯路存档：v3 模糊（幻影）→ v4 近似精确（SCK 分数像素重采样致恒 nil）→ v5 模糊+五闸门（平衡点，测试用例库兜底）。
 - **会话期临时热键**：滚动截屏时用 Carbon 注册无修饰键的空格/回车/Esc（id 空间与 ⇧⌘A 分开），会话结束即注销，全程不需要辅助功能权限。
 - **全局热键用 Carbon 而非 pynput/CGEventTap**：`RegisterEventHotKey` 不需要辅助功能权限，进程后台挂着也能收。
 - **多屏**：每屏一个 borderless 窗口（`CGShieldingWindowLevel` + `canJoinAllSpaces`），各自捕获各自标注，任一屏完成动作即全部关闭。

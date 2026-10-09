@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var scrollSession: ScrollCaptureSession?
     private var toastWin: NSWindow?
+    private var toastImage: NSImage?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -101,7 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pb.writeObjects([img])
     }
 
-    private func saveImage(_ img: NSImage) {
+    private func saveImage(_ img: NSImage, reveal: Bool = true) {
         guard let data = Render.pngData(of: img) else { return }
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Pictures/ShotMark", isDirectory: true)
@@ -116,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         do {
             try data.write(to: url)
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+            if reveal { NSWorkspace.shared.activateFileViewerSelecting([url]) }
         } catch {
             alert("保存失败", error.localizedDescription)
         }
@@ -201,16 +202,17 @@ extension AppDelegate: ShotViewDelegate {
             self.scrollSession = nil
             guard let img = img else { return }   // 取消
             self.copyToPasteboard(img)
-            self.saveImage(img)
             let rep = img.representations.first
-            self.showToast("滚动截屏完成：已复制到剪贴板并保存到 ~/Pictures/ShotMark（\(rep?.pixelsWide ?? 0)×\(rep?.pixelsHigh ?? 0)px）")
+            // 不自动存盘（用户 2026-10-09：时间久了一大堆垃圾）——toast 上给「保存」按钮自选
+            self.showToast("滚动截屏完成：已复制到剪贴板（\(rep?.pixelsWide ?? 0)×\(rep?.pixelsHigh ?? 0)px）", saveImage: img)
         }
         scrollSession = session
         session.start()
     }
 
-    private func showToast(_ text: String) {
+    private func showToast(_ text: String, saveImage img: NSImage? = nil) {
         toastWin?.close()
+        toastImage = img
         let w: CGFloat = 560, h: CGFloat = 44
         guard let screen = NSScreen.main else { return }
         let win = NSWindow(contentRect: NSRect(x: screen.frame.midX - w / 2,
@@ -229,14 +231,30 @@ extension AppDelegate: ShotViewDelegate {
         label.alignment = .center
         label.textColor = .white
         label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        label.frame = NSRect(x: 12, y: 6, width: w - 24, height: h - 12)
+        if img != nil {
+            label.frame = NSRect(x: 12, y: 6, width: w - 96, height: h - 12)
+            let btn = NSButton(title: "保存", target: self, action: #selector(toastSaveClicked))
+            btn.bezelStyle = .rounded
+            btn.frame = NSRect(x: w - 76, y: 8, width: 64, height: 28)
+            bg.addSubview(btn)
+        } else {
+            label.frame = NSRect(x: 12, y: 6, width: w - 24, height: h - 12)
+        }
         bg.addSubview(label)
         win.contentView = bg
         win.orderFrontRegardless()
         toastWin = win
-        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+        Timer.scheduledTimer(withTimeInterval: img != nil ? 6.0 : 3.0, repeats: false) { [weak self] _ in
             self?.toastWin?.close()
             self?.toastWin = nil
+            self?.toastImage = nil
         }
+    }
+
+    @objc private func toastSaveClicked() {
+        if let img = toastImage { saveImage(img, reveal: false) }
+        toastWin?.close()
+        toastWin = nil
+        toastImage = nil
     }
 }
