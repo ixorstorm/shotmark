@@ -59,8 +59,11 @@ enum SelfTest {
             .font: NSFont.systemFont(ofSize: 16, weight: .regular),
             .foregroundColor: NSColor.black,
         ]
-        for (i, y) in [100, 400, 700, 1000, 1300].enumerated() {
-            NSString(string: "这是第 \(i) 行聊天文本 content line").draw(at: CGPoint(x: 16, y: CGFloat(y)), withAttributes: attrs)
+        // 各行内容长度/文本差异要大——否则周期性行 + 一个数字差异会把帧变成完美周期纹理（幻影温床）
+        let lineTexts = ["发起人的需求已经整理完毕", "ok", "这是一个中等长度的回复，包含一些细节描述",
+                         "短", "本次迭代的目标是完成所有功能的联调与验收测试工作", "收到了，我马上看一下这个问题"]
+        for (i, y) in [100, 360, 620, 880, 1140, 1400].enumerated() {
+            NSString(string: lineTexts[i]).draw(at: CGPoint(x: 16, y: CGFloat(y)), withAttributes: attrs)
         }
         NSGraphicsContext.restoreGraphicsState()
         let dbg = NSImage(size: NSSize(width: W, height: SRCH))
@@ -82,7 +85,7 @@ enum SelfTest {
         // 大跳变两帧零重叠，精确匹配必须 nil（旧模糊匹配会瞎猜）
         let phantom = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(1100))
         let p3 = phantom.dy == nil
-        print("whitematch: 大跳变零重叠 dy=\(phantom.dy.map(String.init) ?? "nil") -> \(p3 ? "PASS" : "FAIL")")
+        print("whitematch: 大跳变零重叠 dy=\(phantom.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",phantom.fineErr)) tex=\(phantom.tex) -> \(p3 ? "PASS" : "FAIL")")
         // 噪声回归（SCK 分数像素 sourceRect 重采样/光标闪烁）：帧内撒 ±8 噪声点，仍应匹配 dy=87
         guard let noisyRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: FH,
                                               bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -103,7 +106,7 @@ enum SelfTest {
         let noisy = ScrollCaptureSession.Frame(noisyRep.cgImage!)
         let noisyMatch = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: noisy)
         let p4 = noisyMatch.dy == 87
-        print("whitematch: 噪声帧 dy=\(noisyMatch.dy.map(String.init) ?? "nil") tex=\(noisyMatch.tex) -> \(p4 ? "PASS" : "FAIL")")
+        print("whitematch: 噪声帧 dy=\(noisyMatch.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",noisyMatch.fineErr)) tex=\(noisyMatch.tex) -> \(p4 ? "PASS" : "FAIL")")
     }
 
     /// 造 1600px 长图，用滑动窗口模拟滚动帧，验证匹配 + 拼接还原
