@@ -60,14 +60,29 @@ enum Capture {
         return content.displays.first(where: { $0.width == w && $0.height == h })
     }
 
-    static func grab(screen: NSScreen) async throws -> CGImage {
+    /// 按 displayID 直抓（调用方在主线程解析好映射再传进来）
+    static func grab(displayID: CGDirectDisplayID) async throws -> CGImage {
         let t0 = Date()
         let content = try await freshContent()   // 热键路径不用缓存：过渡期缓存清单里的 SCDisplay 会失配
         let t1 = Date()
         fputs("[timing] ShareableContent \(String(format: "%.0f", t1.timeIntervalSince(t0)*1000))ms\n", stderr)
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+            throw CaptureError.displayNotFound
+        }
+        fputs("[timing] displayID \(displayID) -> SCDisplay \(display.displayID) \(display.width)x\(display.height)\n", stderr)
+        return try await captureDisplay(display)
+    }
+
+    static func grab(screen: NSScreen) async throws -> CGImage {
+        let content = try await freshContent()
         guard let display = findDisplay(for: screen, in: content) else {
             throw CaptureError.displayNotFound
         }
+        return try await captureDisplay(display)
+    }
+
+    private static func captureDisplay(_ display: SCDisplay) async throws -> CGImage {
+        let t1 = Date()
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let scale = CGFloat(filter.pointPixelScale)
         let config = SCStreamConfiguration()

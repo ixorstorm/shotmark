@@ -24,6 +24,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem?.button?.title = "⚠️"
         }
 
+        if CommandLine.arguments.contains("--overlay-test") {
+            // 完整走热键路径（并行抓图 + 覆盖层），把抓到的图落盘后退出
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.startCapture() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                let logURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-capture-test.log")
+                func log(_ s: String) {
+                    fputs("[overlay-test] \(s)\n", stderr)
+                    if let h = try? FileHandle(forWritingTo: logURL) {
+                        h.seekToEndOfFile(); h.write(("[overlay-test] \(s)\n").data(using: .utf8)!); try? h.close()
+                    } else { try? ("[overlay-test] \(s)\n".data(using: .utf8)!).write(to: logURL) }
+                }
+                if let ov = self?.overlays.first, let view = ov.contentView as? ShotView {
+                    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-overlay-test.png")
+                    Render.writePNG(view.captured, to: url)
+                    log("saved -> \(url.path) size=\(view.captured.size)")
+                } else {
+                    log("NO OVERLAY")
+                }
+                NSApp.terminate(nil)
+            }
+            return
+        }
+
         if SelfTest.enabled {
             SelfTest.run()
             if SelfTest.liveEnabled {
@@ -54,12 +77,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var ok = false
             var tccDenied = false
             var firstError = ""
-            // 双屏并行抓（串行时清单一拉两遍 + 逐屏等待，~210ms；并行后 ≈ 单屏耗时）
+            // 双屏并行抓（串行时清单一拉两遍 + 逐屏等待，~210ms；并行后 ≈ 单屏耗时）。
+            // ⚠️ 屏→显示器映射必须在主线程先解析好：NSScreen.deviceDescription 跨线程读不可靠
+            //（实测事故：并行任务里读它导致外屏装上了内屏的图——「按热键就只剩背景」）
             var results: [Int: CGImage] = [:]
+            let jobs: [(Int, CGDirectDisplayID)] = screens.enumerated().compactMap { (i, screen) in
+                guard let did = Capture.displayID(for: screen) else { return nil }
+                fputs("[ShotMark] 映射: screen[\(i)] frame=\(screen.frame.size) id=\(did)\n", stderr)
+                return (i, did)
+            }
             await withTaskGroup(of: (Int, CGImage?, NSError?).self) { group in
-                for (i, screen) in screens.enumerated() {
+                for (i, did) in jobs {
                     group.addTask {
-                        do { return (i, try await Capture.grab(screen: screen), nil) }
+                        do { return (i, try await Capture.grab(displayID: did), nil) }
                         catch { return (i, nil, error as NSError) }
                     }
                 }
@@ -74,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             for (i, screen) in screens.enumerated() {
                 if let cg = results[i] {
+                    fputs("[ShotMark] 覆盖层: screen[\(i)] \(screen.frame.size) <- 图 \(cg.width)x\(cg.height)\n", stderr)
                     presentOverlay(screen: screen, image: NSImage(cgImage: cg, size: screen.frame.size))
                     ok = true
                 }
