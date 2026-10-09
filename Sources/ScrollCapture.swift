@@ -58,6 +58,8 @@ final class ScrollCaptureSession: NSObject {
     private var lastPos = 0
     /// 每次 process 的匹配 dy（含 nil），自检调试用
     var debugDys: [Int?] = []
+    /// 已销毁：阻断 finish/cancel 重入与 in-flight 抓帧复活窗口
+    private var tornDown = false
 
     init(screen: NSScreen, regionPts: CGRect, onFinish: @escaping (NSImage?) -> Void) {
         self.screen = screen
@@ -80,12 +82,16 @@ final class ScrollCaptureSession: NSObject {
     }
 
     func finish() {
+        guard !tornDown else { return }
+        tornDown = true
         let img = compose()
         teardown()
         onFinish(img)
     }
 
     func cancel() {
+        guard !tornDown else { return }
+        tornDown = true
         teardown()
         onFinish(nil)
     }
@@ -93,8 +99,11 @@ final class ScrollCaptureSession: NSObject {
     private func teardown() {
         timer?.invalidate()
         timer = nil
-        HotKey.unregisterRaw(hotKeyRefs)
+        // 注销热键延到下一个 runloop tick：当前可能正处在这枚热键的 Carbon 事件分发中，
+        // 同步注销会释放事件管理器仍在使用的结构 → 堆腐坏（实测三次 pool-pop SIGSEGV）
+        let refs = hotKeyRefs
         hotKeyRefs = []
+        DispatchQueue.main.async { HotKey.unregisterRaw(refs) }
         borderWin?.close()
         borderWin = nil
         previewWin?.close()
@@ -121,18 +130,21 @@ final class ScrollCaptureSession: NSObject {
 
     /// 帧处理（internal 便于离线自检直接驱动）
     func process(newFrame nf: Frame) {
+        guard !tornDown else { return }
         guard firstFrame != nil else {
             firstFrame = nf
             lastFrame = nf
             pointScale = CGFloat(nf.w) / regionPts.width
             capturedBottom = nf.h
             lastPos = 0
+            updatePreview(force: true)      // 第一帧即出预览
             return
         }
         guard let prev = lastFrame else { return }
-        let dyOpt = Self.scrollDelta(prev: prev, new: nf)
-        debugDys.append(dyOpt)
-        guard let dy = dyOpt else { return }  // 未匹配（上滚/滚动过快）：保持 prev，下拍重试
+        let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
+        debugDys.append(detail.dy)
+        debugLog(detail: detail, appended: 0)
+        guard let dy = detail.dy else { return }  // 未匹配（上滚/滚动过快/低纹理）：保持 prev，下拍重试
         let p = lastPos + dy                       // 本帧顶部的绝对位置
         let start = capturedBottom - p             // 帧内「新内容」起始行
         if start < nf.h {                          // 有超出水位线的新内容
@@ -143,6 +155,7 @@ final class ScrollCaptureSession: NSObject {
                 capturedBottom = p + nf.h
                 borderView?.progress = capturedBottom
                 updatePreview()
+                debugLog(detail: detail, appended: nf.h - s)
             }
         }
         lastPos = p
@@ -188,35 +201,87 @@ final class ScrollCaptureSession: NSObject {
 
     // MARK: - 帧间匹配（static，便于离线自检）
 
+    struct ScrollDeltaDetail {
+        let dy: Int?
+        let fineErr: Double
+        let secondErr: Double
+        let tex: Int
+    }
+
     /// 求 new 相对 prev 的向上滚动位移（像素行数，0 = 未动，nil = 无法匹配）
     static func scrollDelta(prev: Frame, new: Frame) -> Int? {
+        scrollDeltaDetailed(prev: prev, new: new).dy
+    }
+
+    /// 带诊断信息的匹配：纹理闸门（全白/低纹理候选一律不可信）+ 次优解判定
+    static func scrollDeltaDetailed(prev: Frame, new: Frame) -> ScrollDeltaDetail {
+        let none = ScrollDeltaDetail(dy: nil, fineErr: .greatestFiniteMagnitude, secondErr: .greatestFiniteMagnitude, tex: 0)
         let H = prev.h
-        guard new.h == H, new.w == prev.w else { return nil }
+        guard new.h == H, new.w == prev.w else { return none }
         let maxDelta = H - 60
-        guard maxDelta > 0 else { return 0 }
-        // 粗扫（步长 8），记录每个候选 dy 的误差
-        var errs: [(Int, Double)] = []
+        guard maxDelta > 0 else { return ScrollDeltaDetail(dy: 0, fineErr: 0, secondErr: 0, tex: 0) }
+        // 粗扫（步长 8），记录每个候选 dy 的误差与纹理分
+        var errs: [(dy: Int, err: Double, tex: Int)] = []
         var dy = 0
         while dy <= maxDelta {
-            errs.append((dy, stripError(prev: prev, new: new, dy: dy)))
+            errs.append((dy, stripError(prev: prev, new: new, dy: dy),
+                         textureScore(prev: prev, new: new, dy: dy)))
             dy += 8
         }
-        guard let (best, bestErr) = errs.min(by: { $0.1 < $1.1 }) else { return nil }
+        // 纹理闸门前置：重叠区「高对比像素」太少的候选（全白/纯色对齐）直接出局。
+        // 白底页上全白对齐 err=0 会抢到全局最优（实测 dy=340 假对齐挤出真匹配 dy=87），
+        // 必须在选优前就过滤，而不是事后否决。
+        let eligible = errs.filter { $0.tex >= 24 }
+        guard let (best, bestErr, _) = eligible.min(by: { $0.err < $1.err }) else { return none }
         // 次优解（排除最优 ±8 邻域）：低纹理内容（纯色/渐变）各 dy 误差接近，
         // 用「显著优于次优」防止误匹配（手滑上滚/来回滚动的关键防线）
-        let secondErr = errs.filter { abs($0.0 - best) > 8 }.map { $0.1 }.min() ?? .greatestFiniteMagnitude
-        // 精扫（±8 步长 1）
-        var fine = best, fineErr = bestErr
+        let secondErr = eligible.filter { abs($0.dy - best) > 8 }.map { $0.err }.min() ?? .greatestFiniteMagnitude
+        // 精扫（±8 步长 1）——同样过纹理闸门：
+        // 粗选若恰好卡在文字边缘（err 非 0 但有纹理），不加闸门会滑进旁边的全白 err=0 假对齐
+        var fine = best, fineErr = bestErr, fineTex = textureScore(prev: prev, new: new, dy: best)
         let lo = max(0, best - 8), hi = min(maxDelta, best + 8)
         if lo <= hi {
             for d in lo...hi {
+                let t = textureScore(prev: prev, new: new, dy: d)
+                guard t >= 24 else { continue }
                 let e = stripError(prev: prev, new: new, dy: d)
-                if e < fineErr { fineErr = e; fine = d }
+                if e < fineErr { fineErr = e; fine = d; fineTex = t }
             }
         }
+        let tex = fineTex
         let decisive = fineErr < 1.5 || fineErr < 0.6 * secondErr
-        if fineErr < 6.0 && decisive { return fine }
-        return nil
+        let dyOut: Int? = (fineErr < 6.0 && decisive) ? fine : nil
+        return ScrollDeltaDetail(dy: dyOut, fineErr: fineErr, secondErr: secondErr, tex: tex)
+    }
+
+    /// 重叠区纹理分：采样点中与右邻像素高对比（|ΔRGB| > 24）的数量
+    static func textureScore(prev: Frame, new: Frame, dy: Int) -> Int {
+        let overlap = prev.h - dy
+        guard overlap > 40 else { return 0 }
+        let rowStep = max(2, overlap / 64)
+        let colStep = max(4, prev.w / 96)
+        var tex = 0
+        prev.data.withUnsafeBytes { pBuf in
+            new.data.withUnsafeBytes { nBuf in
+                let p = pBuf.bindMemory(to: UInt8.self)
+                let q = nBuf.bindMemory(to: UInt8.self)
+                var r = 0
+                while r < overlap {
+                    let pr = (dy + r) * prev.bpr
+                    let nr = r * new.bpr
+                    var c = 4
+                    while c < prev.w {
+                        let i = pr + c * 4, j = nr + c * 4
+                        let dp = abs(Int(p[i]) - Int(p[i - 4])) + abs(Int(p[i + 1]) - Int(p[i - 3])) + abs(Int(p[i + 2]) - Int(p[i - 2]))
+                        let dq = abs(Int(q[j]) - Int(q[j - 4])) + abs(Int(q[j + 1]) - Int(q[j - 3])) + abs(Int(q[j + 2]) - Int(q[j - 2]))
+                        if dp > 24 || dq > 24 { tex += 1 }
+                        c += colStep
+                    }
+                    r += rowStep
+                }
+            }
+        }
+        return tex
     }
 
     /// prev 的 [dy..H) 与 new 的 [0..H-dy) 的平均像素差（抽样）
@@ -272,9 +337,23 @@ final class ScrollCaptureSession: NSObject {
         borderWin = win
     }
 
+    // MARK: - 调试日志（每帧匹配详情，排障用）
+
+    private func debugLog(detail: ScrollDeltaDetail, appended: Int) {
+        let line = "\(Date()) dy=\(detail.dy.map(String.init) ?? "nil") err=\(String(format: "%.2f", detail.fineErr)) second=\(String(format: "%.2f", detail.secondErr)) tex=\(detail.tex) append=\(appended) bottom=\(capturedBottom)\n"
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-scroll.log")
+        guard let d = line.data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(d); try? h.close()
+        } else {
+            try? d.write(to: url)
+        }
+    }
+
     // MARK: - 实时拼接预览窗（对标飞书）
 
     private func updatePreview(force: Bool = false) {
+        guard !tornDown else { return }
         let now = Date()
         guard force || now.timeIntervalSince(lastPreviewAt) > 0.8 else { return }
         lastPreviewAt = now

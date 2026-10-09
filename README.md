@@ -73,7 +73,7 @@ Sources/
 
 - **视图与导出共用一套标注绘制代码**（`Render.draw`）：导出时给 context 套 `translate(-sel.origin) → scale(×2)` 仿射，Retina 下导出的就是 2x 像素图。
 - **马赛克**：把选区对应底图块画进 1/9 大小的临时 rep，再 `imageInterpolation = .none` 放大回来。
-- **滚动截屏拼接**：`SCStreamConfiguration.sourceRect` 只抓选区（300ms/拍），且 `SCContentFilter(excludingWindows:)` + 窗口 `sharingType=.none` 双保险让边框/预览窗**对截屏隐身**。帧间匹配 = 粗扫（步长 8）+ 精扫（±8）找 `prev[dy..H)` vs `new[0..H-dy)` 平均像素差最小的 dy。**水位线去重**：只追加超出已拼底部的内容，来回滚动/手滑上滚不重复拼接；**次优解判定**（误差须 <6 且几乎全等或显著优于次优 dy）防纯色/渐变低纹理内容误匹配（实测 dy=33 假匹配会被拒）。**实时预览**：0.8s 节流的浮动预览窗随拼接实时长大。拼接用 `NSImage.draw`（AppKit y-up 语义）——**不要用 `CGContext.draw(cgImage)`，在 bitmap context 里方向语义不可靠**（实测翻车：翻转写法单帧误差 13.6）。
+- **滚动截屏拼接**：`SCStreamConfiguration.sourceRect` 只抓选区（300ms/拍），且 `SCContentFilter(excludingWindows:)` + 窗口 `sharingType=.none` 双保险让边框/预览窗**对截屏隐身**。帧间匹配 = 粗扫（步长 8）+ 精扫（±8）找 `prev[dy..H)` vs `new[0..H-dy)` 平均像素差最小的 dy。**水位线去重**：只追加超出已拼底部的内容，来回滚动/手滑上滚不重复拼接；**纹理闸门 + 次优解判定**：候选 dy 先按「重叠区高对比像素 ≥24」过滤再选优（粗扫精扫双闸门——全白 err=0 的假对齐在选优前就出局），且误差须 <6、几乎全等或显著优于次优 dy。防纯色/渐变/白底页幻影位移（实测 dy=33、dy=340 两类假匹配均被拒）。**实时预览**：0.8s 节流的浮动预览窗随拼接实时长大。拼接用 `NSImage.draw`（AppKit y-up 语义）——**不要用 `CGContext.draw(cgImage)`，在 bitmap context 里方向语义不可靠**（实测翻车：翻转写法单帧误差 13.6）。
 - **会话期临时热键**：滚动截屏时用 Carbon 注册无修饰键的空格/回车/Esc（id 空间与 ⇧⌘A 分开），会话结束即注销，全程不需要辅助功能权限。
 - **全局热键用 Carbon 而非 pynput/CGEventTap**：`RegisterEventHotKey` 不需要辅助功能权限，进程后台挂着也能收。
 - **多屏**：每屏一个 borderless 窗口（`CGShieldingWindowLevel` + `canJoinAllSpaces`），各自捕获各自标注，任一屏完成动作即全部关闭。
@@ -95,7 +95,8 @@ Sources/
 ## 已知限制 / TODO
 
 - 无序号标注、钉图不可二次编辑、文字提交后不可移动（重做=⌘Z 重画）。
-- 滚动截屏：上滚/手滑帧自动跳过不误拼；大面积纯色/低纹理区域滚动时可能暂时不追加（次优解判定宁可不拼也不拼错）；长图完成后直接复制+保存，暂不支持回覆盖层再标注。
+- 滚动截屏：上滚/手滑帧自动跳过不误拼；大面积纯白/低纹理区域滚动时会暂停追加、滚到有纹理处自动恢复（纹理闸门宁可不拼也不拼错）；长图完成后直接复制+保存，暂不支持回覆盖层再标注。
+- 每帧匹配详情写 `$TMPDIR/shotmark-scroll.log`（dy/err/纹理分/追加量/水位线），拼接异常时把这份日志给我即可定位。
 - 重新编译后 ad-hoc 签名变化可能使屏幕录制授权失效，重跑一次授权流程即可（自签名证书版不受影响，见下节）。
 - 改热键：改 `Sources/HotKey.swift` 里的 `keyCode`/`modifiers` 两行后 `make`。
 

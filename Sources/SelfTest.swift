@@ -40,6 +40,44 @@ enum SelfTest {
 
         // 3) 滚动拼接离线自检
         testScrollStitch(outDir: outDir)
+        testWhitePageMatching(outDir: outDir)
+    }
+
+    /// 白底稀疏文本页：上滚（手滑）必须 nil（幻影 dy 会重复拼接）；正常下滚仍正确匹配
+    private static func testWhitePageMatching(outDir: URL) {
+        let W = 400, SRCH = 1600, FH = 400
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: SRCH,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep) else { print("whitematch: init FAIL"); return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: W, height: SRCH).fill()
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 16, weight: .regular),
+            .foregroundColor: NSColor.black,
+        ]
+        for (i, y) in [100, 400, 700, 1000, 1300].enumerated() {
+            NSString(string: "这是第 \(i) 行聊天文本 content line").draw(at: CGPoint(x: 16, y: CGFloat(y)), withAttributes: attrs)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        let dbg = NSImage(size: NSSize(width: W, height: SRCH))
+        dbg.addRepresentation(rep)
+        Render.writePNG(dbg, to: outDir.appendingPathComponent("white-src.png"))
+        guard let src = rep.cgImage else { print("whitematch: src FAIL"); return }
+        func frame(_ off: Int) -> ScrollCaptureSession.Frame {
+            ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!)
+        }
+        // 上滚（内容下移）：白对白的幻影对齐必须被拒
+        let up = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(258), new: frame(171))
+        let p1 = up.dy == nil
+        print("whitematch: 上滚 dy=\(up.dy.map(String.init) ?? "nil") tex=\(up.tex) -> \(p1 ? "PASS" : "FAIL")")
+        // 正常下滚：稀疏文本提供足够纹理，仍应正确匹配
+        let down = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(87))
+        let p2 = down.dy == 87
+        print("whitematch: 下滚 dy=\(down.dy.map(String.init) ?? "nil") tex=\(down.tex) -> \(p2 ? "PASS" : "FAIL")")
     }
 
     /// 造 1600px 长图，用滑动窗口模拟滚动帧，验证匹配 + 拼接还原
