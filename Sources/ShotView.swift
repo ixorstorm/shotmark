@@ -5,6 +5,8 @@ enum FinishAction { case copy, save, pin }
 protocol ShotViewDelegate: AnyObject {
     /// image=nil 表示取消
     func shotView(_ view: ShotView, didFinish image: NSImage?, action: FinishAction?)
+    /// 请求进入滚动截屏（基于当前选区）
+    func shotViewDidRequestScroll(_ view: ShotView, selection: CGRect)
 }
 
 /// 截图标注主视图：全屏覆盖，承载选区、标注、工具栏。
@@ -155,7 +157,7 @@ final class ShotView: NSView {
 
     // MARK: - 工具栏
 
-    private enum Btn { case tool(Tool), color(Int), width, undo, pin, save, copy, cancel }
+    private enum Btn { case tool(Tool), color(Int), width, undo, scroll, pin, save, copy, cancel }
 
     private let toolOrder: [(Tool, String)] = [
         (.pen, "pencil"), (.arrow, "arrow.up.right"), (.rect, "rectangle"),
@@ -176,7 +178,7 @@ final class ShotView: NSView {
         x += 10
         push(.width, 34)
         x += 10
-        for b in [Btn.undo, .pin, .save, .copy, .cancel] { push(b, 30) }
+        for b in [Btn.undo, .scroll, .pin, .save, .copy, .cancel] { push(b, 30) }
         x += 10
         let stripW = x
 
@@ -229,6 +231,8 @@ final class ShotView: NSView {
                 path.stroke()
             case .undo:
                 drawIcon("arrow.uturn.left", in: r, tint: .white, alpha: annotations.isEmpty ? 0.3 : 1)
+            case .scroll:
+                drawIcon("scroll", in: r, tint: .white)
             case .pin:
                 drawIcon("pin.fill", in: r, tint: .white)
             case .save:
@@ -348,6 +352,10 @@ final class ShotView: NSView {
             widthIndex = (widthIndex + 1) % ShotView.widths.count
         case .undo:
             if !annotations.isEmpty { annotations.removeLast() }
+        case .scroll:
+            guard let sel = selection else { return }
+            delegate?.shotViewDidRequestScroll(self, selection: sel)
+            return
         case .copy:
             finish(.copy)
             return

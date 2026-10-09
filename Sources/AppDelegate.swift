@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlays: [OverlayWindow] = []
     private var pinnedWindows: [NSWindow] = []
     private var statusItem: NSStatusItem?
+    private var scrollSession: ScrollCaptureSession?
+    private var toastWin: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -30,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 截图入口
 
     @objc func startCapture() {
+        if scrollSession != nil { return }     // 滚动截屏进行中，忽略
         if !overlays.isEmpty {           // 已有覆盖层 = 再按一次热键关闭
             closeOverlays()
             return
@@ -186,6 +189,52 @@ extension AppDelegate: ShotViewDelegate {
         case .copy: copyToPasteboard(img)
         case .save: saveImage(img)
         case .pin:  pinImage(img)
+        }
+    }
+
+    func shotViewDidRequestScroll(_ view: ShotView, selection: CGRect) {
+        guard let screen = view.window?.screen else { return }
+        closeOverlays()
+        let session = ScrollCaptureSession(screen: screen, regionPts: selection) { [weak self] img in
+            guard let self = self else { return }
+            self.scrollSession = nil
+            guard let img = img else { return }   // 取消
+            self.copyToPasteboard(img)
+            self.saveImage(img)
+            let rep = img.representations.first
+            self.showToast("滚动截屏完成：已复制到剪贴板并保存到 ~/Pictures/ShotMark（\(rep?.pixelsWide ?? 0)×\(rep?.pixelsHigh ?? 0)px）")
+        }
+        scrollSession = session
+        session.start()
+    }
+
+    private func showToast(_ text: String) {
+        toastWin?.close()
+        let w: CGFloat = 560, h: CGFloat = 44
+        guard let screen = NSScreen.main else { return }
+        let win = NSWindow(contentRect: NSRect(x: screen.frame.midX - w / 2,
+                                               y: screen.frame.maxY - 110,
+                                               width: w, height: h),
+                           styleMask: .borderless, backing: .buffered, defer: false)
+        win.level = .floating
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        let bg = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.92).cgColor
+        bg.layer?.cornerRadius = 10
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.alignment = .center
+        label.textColor = .white
+        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        label.frame = NSRect(x: 12, y: 6, width: w - 24, height: h - 12)
+        bg.addSubview(label)
+        win.contentView = bg
+        win.orderFrontRegardless()
+        toastWin = win
+        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            self?.toastWin?.close()
+            self?.toastWin = nil
         }
     }
 }

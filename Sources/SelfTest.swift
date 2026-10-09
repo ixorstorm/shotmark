@@ -37,6 +37,72 @@ enum SelfTest {
                 print("view   -> \(url.path)")
             }
         }
+
+        // 3) 滚动拼接离线自检
+        testScrollStitch(outDir: outDir)
+    }
+
+    /// 造 1600px 长图，用滑动窗口模拟滚动帧，验证匹配 + 拼接还原
+    private static func testScrollStitch(outDir: URL) {
+        let W = 400, SRCH = 1600, FH = 400
+        // 源图：渐变底 + 每 40px 一行序号
+        guard let srcRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: SRCH,
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                            isPlanar: false, colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0, bitsPerPixel: 0),
+              let sctx = NSGraphicsContext(bitmapImageRep: srcRep) else { print("stitch: init FAIL"); return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = sctx
+        NSGradient(colors: [NSColor(srgbRed: 0.2, green: 0.3, blue: 0.5, alpha: 1),
+                            NSColor(srgbRed: 0.6, green: 0.3, blue: 0.2, alpha: 1)])!
+            .draw(in: NSRect(x: 0, y: 0, width: W, height: SRCH), angle: -90)
+        let numAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 20, weight: .bold),
+            .foregroundColor: NSColor.white,
+        ]
+        for y in stride(from: 10, to: SRCH - 30, by: 40) {
+            NSString(string: "row \(y)").draw(at: CGPoint(x: 20, y: CGFloat(y)), withAttributes: numAttrs)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let srcCG = srcRep.cgImage else { print("stitch: src FAIL"); return }
+
+        // 模拟滚动：帧 i = 源图 [off_i, off_i+FH)（CGImage.cropping 原点左上，向下滑动）
+        let offsets = [0, 87, 171, 258]
+        var frames: [ScrollCaptureSession.Frame] = offsets.compactMap { off in
+            srcCG.cropping(to: CGRect(x: 0, y: off, width: W, height: FH)).map { ScrollCaptureSession.Frame($0) }
+        }
+        guard frames.count == offsets.count else { print("stitch: frames FAIL"); return }
+
+        // 逐帧匹配 + 累积
+        var strips: [CGImage] = []
+        var last = frames.removeFirst()
+        var dyLog: [Int] = []
+        for f in frames {
+            guard let dy = ScrollCaptureSession.scrollDelta(prev: last, new: f) else {
+                print("stitch: 匹配失败 nil"); return
+            }
+            dyLog.append(dy)
+            if dy > 0, let s = f.cg.cropping(to: CGRect(x: 0, y: f.h - dy, width: f.w, height: dy)) {
+                strips.append(s)
+            }
+            last = f
+        }
+
+        // 拼接 & 与原图同区段对比
+        guard let firstCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: FH)),
+              let composed = ScrollCaptureSession.compose(first: firstCG, strips: strips, pointScale: 1),
+              let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: composedCG.height)) else {
+            print("stitch: compose FAIL"); return
+        }
+        let expectH = FH + (offsets.last ?? 0)
+        let err = ScrollCaptureSession.stripError(prev: ScrollCaptureSession.Frame(composedCG),
+                                                  new: ScrollCaptureSession.Frame(refCG), dy: 0)
+        let pass = composedCG.height == expectH && err < 3.0
+        print("stitch: dy=\(dyLog) 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
+        let out = NSImage(size: NSSize(width: W, height: composedCG.height))
+        out.addRepresentation(NSBitmapImageRep(cgImage: composedCG))
+        Render.writePNG(out, to: outDir.appendingPathComponent("scroll-stitch.png"))
     }
 
     /// 假底图：两个窗口 + 一段「机密」文字
