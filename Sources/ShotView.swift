@@ -454,10 +454,39 @@ final class ShotView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let p = event.locationInWindow
         if let sel = selection {
-            let (strip, _) = toolbarLayout(sel)
-            if strip.contains(p) { NSCursor.pointingHand.set(); return }
+            let (strip, items) = toolbarLayout(sel)
+            if strip.contains(p) {
+                NSCursor.pointingHand.set()
+                toolTip = items.first(where: { $0.1.contains(p) }).map { tooltip(for: $0.0) }
+                return
+            }
+            toolTip = nil
             if sel.contains(p) { (tool == .text ? NSCursor.iBeam : NSCursor.crosshair).set(); return }
+        } else {
+            toolTip = nil
         }
         NSCursor.crosshair.set()
+    }
+
+    private func tooltip(for btn: Btn) -> String {
+        switch btn {
+        case .tool(let t):
+            switch t {
+            case .pen: return "画笔"
+            case .arrow: return "箭头"
+            case .rect: return "矩形"
+            case .ellipse: return "椭圆"
+            case .text: return "文字"
+            case .mosaic: return "马赛克"
+            }
+        case .color: return "颜色"
+        case .width: return "线宽（点击切换 细/中/粗）"
+        case .undo: return "撤销（⌘Z）"
+        case .scroll: return "滚动截图"
+        case .pin: return "钉图：把截图钉在屏幕上"
+        case .save: return "保存到 ~/Pictures/ShotMark（⌘S）"
+        case .copy: return "完成：复制到剪贴板（⏎ / 空格 / ⌘C）"
+        case .cancel: return "取消（Esc）"
+        }
     }
 }
