@@ -92,6 +92,13 @@ Sources/
 
 排查工具：`open ~/Applications/ShotMark.app --args --capture-test`（以真实 App 身份跑一次捕获，结果写 `$TMPDIR/shotmark-capture-test.log`，含 preflight 状态与真实错误码）。
 
+## 性能
+
+- **启动预热**：App 启动即后台拉 `SCShareableContent`（SCK/TCC 管线预热），第一次按热键就命中缓存。
+- **内容清单缓存**：`SCShareableContent` 单拉 ~55ms，缓存 5s + 并发共享同一拉取任务——热键路径不再重复拉清单，滚动会话每拍省 ~55ms。
+- **多屏并行抓图**：两屏 `withTaskGroup` 并行（串行 ~210ms → 并行 ≈ 单屏耗时）。
+- 热键 → 覆盖层实测：预热后 ≈ 100-150ms。
+
 ## 已知限制 / TODO
 
 - 无序号标注、钉图不可二次编辑、文字提交后不可移动（重做=⌘Z 重画）。

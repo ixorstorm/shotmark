@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
+        Capture.warm()   // 后台预热 SCK 管线 + 内容清单缓存
         let hotkeyOK = HotKey.register()
         HotKey.onFire = { [weak self] in self?.startCapture() }
         if !hotkeyOK {
@@ -53,19 +54,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var ok = false
             var tccDenied = false
             var firstError = ""
-            for screen in screens {
-                do {
-                    let cg = try await Capture.grab(screen: screen)
-                    let img = NSImage(cgImage: cg, size: screen.frame.size)
-                    presentOverlay(screen: screen, image: img)
-                    ok = true
-                } catch {
-                    let nserr = error as NSError
-                    fputs("[ShotMark] 捕获失败: \(nserr.domain) \(nserr.code) \(nserr.localizedDescription)\n", stderr)
-                    if nserr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", nserr.code == -3801 {
-                        tccDenied = true
+            // 双屏并行抓（串行时清单一拉两遍 + 逐屏等待，~210ms；并行后 ≈ 单屏耗时）
+            var results: [Int: CGImage] = [:]
+            await withTaskGroup(of: (Int, CGImage?, NSError?).self) { group in
+                for (i, screen) in screens.enumerated() {
+                    group.addTask {
+                        do { return (i, try await Capture.grab(screen: screen), nil) }
+                        catch { return (i, nil, error as NSError) }
                     }
-                    if firstError.isEmpty { firstError = "\(nserr.code) \(nserr.localizedDescription)" }
+                }
+                for await (i, cg, err) in group {
+                    if let cg = cg { results[i] = cg }
+                    if let err = err {
+                        fputs("[ShotMark] 捕获失败: \(err.domain) \(err.code) \(err.localizedDescription)\n", stderr)
+                        if err.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", err.code == -3801 { tccDenied = true }
+                        if firstError.isEmpty { firstError = "\(err.code) \(err.localizedDescription)" }
+                    }
+                }
+            }
+            for (i, screen) in screens.enumerated() {
+                if let cg = results[i] {
+                    presentOverlay(screen: screen, image: NSImage(cgImage: cg, size: screen.frame.size))
+                    ok = true
                 }
             }
             if ok {
