@@ -40,6 +40,10 @@ final class ScrollCaptureSession: NSObject {
     private let onFinish: (NSImage?) -> Void
 
     private var borderWin: NSWindow?
+    private weak var borderView: ScrollBorderView?
+    private var previewWin: NSWindow?
+    private weak var previewImgView: NSImageView?
+    private var lastPreviewAt = Date.distantPast
     private var timer: Timer?
     private var capturing = false
     private var hotKeyRefs: [EventHotKeyRef?] = []
@@ -48,6 +52,12 @@ final class ScrollCaptureSession: NSObject {
     private var lastFrame: Frame?
     private var strips: [CGImage] = []
     private var pointScale: CGFloat = 2
+    /// 水位线：已拼接内容的底部（像素行，相对第一帧顶部）与上一帧的绝对顶部位置。
+    /// 支持来回滚动（手滑上滚/上下反复）——新帧只有超出水位线的部分才会被追加，杜绝重复拼接。
+    private var capturedBottom = 0
+    private var lastPos = 0
+    /// 每次 process 的匹配 dy（含 nil），自检调试用
+    var debugDys: [Int?] = []
 
     init(screen: NSScreen, regionPts: CGRect, onFinish: @escaping (NSImage?) -> Void) {
         self.screen = screen
@@ -87,6 +97,8 @@ final class ScrollCaptureSession: NSObject {
         hotKeyRefs = []
         borderWin?.close()
         borderWin = nil
+        previewWin?.close()
+        previewWin = nil
     }
 
     // MARK: - 抓帧
@@ -107,20 +119,33 @@ final class ScrollCaptureSession: NSObject {
         }
     }
 
-    private func process(newFrame nf: Frame) {
+    /// 帧处理（internal 便于离线自检直接驱动）
+    func process(newFrame nf: Frame) {
         guard firstFrame != nil else {
             firstFrame = nf
             lastFrame = nf
             pointScale = CGFloat(nf.w) / regionPts.width
+            capturedBottom = nf.h
+            lastPos = 0
             return
         }
         guard let prev = lastFrame else { return }
-        guard let dy = Self.scrollDelta(prev: prev, new: nf) else { return }  // 未匹配：保持 prev，下拍重试
-        if dy > 0 {
-            if let strip = nf.cg.cropping(to: CGRect(x: 0, y: nf.h - dy, width: nf.w, height: dy)) {
+        let dyOpt = Self.scrollDelta(prev: prev, new: nf)
+        debugDys.append(dyOpt)
+        guard let dy = dyOpt else { return }  // 未匹配（上滚/滚动过快）：保持 prev，下拍重试
+        let p = lastPos + dy                       // 本帧顶部的绝对位置
+        let start = capturedBottom - p             // 帧内「新内容」起始行
+        if start < nf.h {                          // 有超出水位线的新内容
+            let s = max(0, start)
+            if s < nf.h,
+               let strip = nf.cg.cropping(to: CGRect(x: 0, y: s, width: nf.w, height: nf.h - s)) {
                 strips.append(strip)
+                capturedBottom = p + nf.h
+                borderView?.progress = capturedBottom
+                updatePreview()
             }
         }
+        lastPos = p
         lastFrame = nf
     }
 
@@ -169,14 +194,17 @@ final class ScrollCaptureSession: NSObject {
         guard new.h == H, new.w == prev.w else { return nil }
         let maxDelta = H - 60
         guard maxDelta > 0 else { return 0 }
-        // 粗扫（步长 8）
-        var best = 0, bestErr = Double.greatestFiniteMagnitude
+        // 粗扫（步长 8），记录每个候选 dy 的误差
+        var errs: [(Int, Double)] = []
         var dy = 0
         while dy <= maxDelta {
-            let e = stripError(prev: prev, new: new, dy: dy)
-            if e < bestErr { bestErr = e; best = dy }
+            errs.append((dy, stripError(prev: prev, new: new, dy: dy)))
             dy += 8
         }
+        guard let (best, bestErr) = errs.min(by: { $0.1 < $1.1 }) else { return nil }
+        // 次优解（排除最优 ±8 邻域）：低纹理内容（纯色/渐变）各 dy 误差接近，
+        // 用「显著优于次优」防止误匹配（手滑上滚/来回滚动的关键防线）
+        let secondErr = errs.filter { abs($0.0 - best) > 8 }.map { $0.1 }.min() ?? .greatestFiniteMagnitude
         // 精扫（±8 步长 1）
         var fine = best, fineErr = bestErr
         let lo = max(0, best - 8), hi = min(maxDelta, best + 8)
@@ -186,8 +214,8 @@ final class ScrollCaptureSession: NSObject {
                 if e < fineErr { fineErr = e; fine = d }
             }
         }
-        if fineErr < 6.0 { return fine }            // 高置信（含 dy=0 静止）
-        if fineErr < 10.0, fine > 0 { return fine } // 有噪声但仍有明确最小值
+        let decisive = fineErr < 1.5 || fineErr < 0.6 * secondErr
+        if fineErr < 6.0 && decisive { return fine }
         return nil
     }
 
@@ -236,17 +264,71 @@ final class ScrollCaptureSession: NSObject {
         win.isOpaque = false
         win.backgroundColor = .clear
         win.ignoresMouseEvents = true
-        win.contentView = ScrollBorderView(frame: NSRect(origin: .zero, size: frame.size))
+        win.sharingType = .none          // 对截屏隐身，边框不入长图
+        let bv = ScrollBorderView(frame: NSRect(origin: .zero, size: frame.size))
+        win.contentView = bv
+        borderView = bv
         win.orderFrontRegardless()
         borderWin = win
     }
+
+    // MARK: - 实时拼接预览窗（对标飞书）
+
+    private func updatePreview(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastPreviewAt) > 0.8 else { return }
+        lastPreviewAt = now
+        guard let img = compose() else { return }
+        if previewWin == nil { makePreviewWindow() }
+        previewImgView?.image = img
+        let maxW: CGFloat = 340, maxH: CGFloat = 480, pad: CGFloat = 10
+        let k = min(maxW / img.size.width, maxH / img.size.height, 1.0)
+        let w = max(48, img.size.width * k) + pad * 2
+        let h = max(48, img.size.height * k) + pad * 2
+        guard let win = previewWin, let bf = borderWin?.frame else { return }
+        // 优先放选区右侧，放不下放左侧
+        var x = bf.maxX + 12
+        if x + w > screen.frame.maxX - 8 { x = bf.minX - 12 - w }
+        x = max(screen.frame.minX + 8, x)
+        let y = min(bf.maxY - h, screen.frame.maxY - h - 8)
+        win.setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
+        previewImgView?.frame = NSRect(x: 10, y: 10, width: w - 20, height: h - 20)
+    }
+
+    private func makePreviewWindow() {
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+                           styleMask: .borderless, backing: .buffered, defer: false)
+        win.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.ignoresMouseEvents = true
+        win.sharingType = .none          // 预览窗也不入长图
+        let bg = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.85).cgColor
+        bg.layer?.cornerRadius = 10
+        let iv = NSImageView(frame: NSRect(x: 10, y: 10, width: 180, height: 180))
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        bg.addSubview(iv)
+        win.contentView = bg
+        previewImgView = iv
+        win.orderFrontRegardless()
+        previewWin = win
+    }
 }
 
-/// 选区边框（虚线蓝）+ 顶部操作提示
+/// 选区边框（虚线蓝）+ 顶部操作提示（含已拼接长度）
 final class ScrollBorderView: NSView {
+    var progress: Int = 0 {
+        didSet { needsDisplay = true }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         // 顶部提示条
-        let hint = "滚动截屏进行中 · 滚动滚轮 · 空格/回车 完成 · Esc 取消"
+        let hint = progress > 0
+            ? "滚动截屏中 · 已拼 \(progress)px · 空格/回车 完成 · Esc 取消"
+            : "滚动截屏进行中 · 滚动滚轮 · 空格/回车 完成 · Esc 取消"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .medium),
             .foregroundColor: NSColor.white,

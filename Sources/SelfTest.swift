@@ -66,40 +66,36 @@ enum SelfTest {
         NSGraphicsContext.restoreGraphicsState()
         guard let srcCG = srcRep.cgImage else { print("stitch: src FAIL"); return }
 
-        // 模拟滚动：帧 i = 源图 [off_i, off_i+FH)（CGImage.cropping 原点左上，向下滑动）
-        let offsets = [0, 87, 171, 258]
-        var frames: [ScrollCaptureSession.Frame] = offsets.compactMap { off in
+        // 模拟滚动（含手滑场景：下滚→上滚→回到原位→继续下滚）：
+        // 帧 i = 源图 [off_i, off_i+FH)（CGImage.cropping 原点左上）
+        let offsets = [0, 87, 171, 258, 171, 258, 345]
+        let frames: [ScrollCaptureSession.Frame] = offsets.compactMap { off in
             srcCG.cropping(to: CGRect(x: 0, y: off, width: W, height: FH)).map { ScrollCaptureSession.Frame($0) }
         }
         guard frames.count == offsets.count else { print("stitch: frames FAIL"); return }
 
-        // 逐帧匹配 + 累积
-        var strips: [CGImage] = []
-        var last = frames.removeFirst()
-        var dyLog: [Int] = []
-        for f in frames {
-            guard let dy = ScrollCaptureSession.scrollDelta(prev: last, new: f) else {
-                print("stitch: 匹配失败 nil"); return
-            }
-            dyLog.append(dy)
-            if dy > 0, let s = f.cg.cropping(to: CGRect(x: 0, y: f.h - dy, width: f.w, height: dy)) {
-                strips.append(s)
-            }
-            last = f
+        // 用真实会话驱动（水位线去重逻辑）
+        var result: NSImage?
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { img in
+            result = img
         }
-
-        // 拼接 & 与原图同区段对比
-        guard let firstCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: FH)),
-              let composed = ScrollCaptureSession.compose(first: firstCG, strips: strips, pointScale: 1),
-              let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: composedCG.height)) else {
+        for f in frames { session.process(newFrame: f) }
+        print("stitch: matchedDys=\(session.debugDys.map { $0.map(String.init) ?? "nil" })")
+        session.finish()
+        guard let composed = result,
+              let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             print("stitch: compose FAIL"); return
         }
-        let expectH = FH + (offsets.last ?? 0)
+        // 期望：上滚和回原位不追加内容，最终覆盖源图 [0, 345+FH) 共 745 行
+        let expectH = FH + 345
+        guard let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: expectH)) else {
+            print("stitch: ref FAIL"); return
+        }
         let err = ScrollCaptureSession.stripError(prev: ScrollCaptureSession.Frame(composedCG),
                                                   new: ScrollCaptureSession.Frame(refCG), dy: 0)
         let pass = composedCG.height == expectH && err < 3.0
-        print("stitch: dy=\(dyLog) 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
+        print("stitch: 来回滚动 offsets=\(offsets) 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
         let out = NSImage(size: NSSize(width: W, height: composedCG.height))
         out.addRepresentation(NSBitmapImageRep(cgImage: composedCG))
         Render.writePNG(out, to: outDir.appendingPathComponent("scroll-stitch.png"))
