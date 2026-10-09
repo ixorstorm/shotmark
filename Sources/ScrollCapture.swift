@@ -77,7 +77,7 @@ final class ScrollCaptureSession: NSObject {
             guard let self = self else { return }
             if code == 53 { self.cancel() } else { self.finish() }
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             self?.tick()
         }
         tick()
@@ -227,68 +227,102 @@ final class ScrollCaptureSession: NSObject {
     // MARK: - 帧间匹配（static，便于离线自检）
 
     struct ScrollDeltaDetail {
-        let dy: Int?
-        let fineErr: Double
-        let secondErr: Double
-        let tex: Int
+        let dy: Int?        // >0 下滚（底部新增 dy 行）/ <0 上滚（顶部新增 -dy 行）/ 0 静止 / nil 无法匹配
+        let overlap: Int    // 精确匹配的重叠行数
+        let tex: Int        // 重叠区纹理分
     }
 
-    /// 求 new 相对 prev 的向上滚动位移（像素行数，0 = 未动，nil = 无法匹配）
+    /// 带诊断信息的双向匹配（ShareX 式行级精确匹配）：
+    /// dy>0 下滚（底部新增 dy 行）/ dy<0 上滚（顶部新增 -dy 行）/ 0 静止 / nil 无法匹配。
+    /// 正向配不上再反向扫。宁可 nil 跳过也绝不猜——模糊阈值匹配是幻影位移的温床
+    ///（实测：dy=660 顶满扫描边界、err 5.95 擦边过线 → 660 行错位内容追加 → 长图重复块）。
+    static func scrollDeltaDetailed(prev: Frame, new: Frame) -> ScrollDeltaDetail {
+        let none = ScrollDeltaDetail(dy: nil, overlap: 0, tex: 0)
+        let H = prev.h
+        guard new.h == H, new.w == prev.w else { return none }
+        let margin = max(16, min(prev.w / 20, prev.w / 3))   // 左右边距：避开滚动条/窗口圆角
+        // 双向都算，取重叠更大者——重叠行数就是证据量：
+        // 幻影匹配的对齐区天然短（白底页实测：幻影正向 68 行 vs 真反向 313 行）
+        var fwdMatch: ScrollDeltaDetail?
+        if let fwd = matchForward(prev: prev, new: new, margin: margin) {
+            let tex = textureScore(prev: prev, new: new, dy: fwd.dy)
+            if fwd.overlap >= 24, tex >= 24 {
+                fwdMatch = ScrollDeltaDetail(dy: fwd.dy, overlap: fwd.overlap, tex: tex)
+            }
+        }
+        var bwdMatch: ScrollDeltaDetail?
+        if let bwd = matchBackward(prev: prev, new: new, margin: margin) {
+            // 反向重叠区 = new 的下部 vs prev 的上部，换算成 textureScore 的参数视角
+            let tex = textureScore(prev: new, new: prev, dy: bwd.prependRows)
+            if bwd.overlap >= 24, tex >= 24 {
+                bwdMatch = ScrollDeltaDetail(dy: -bwd.prependRows, overlap: bwd.overlap, tex: tex)
+            }
+        }
+        switch (fwdMatch, bwdMatch) {
+        case let (f?, b?): return f.overlap >= b.overlap ? f : b
+        case let (f?, nil): return f
+        case let (nil, b?): return b
+        default: return none
+        }
+    }
+
     static func scrollDelta(prev: Frame, new: Frame) -> Int? {
         scrollDeltaDetailed(prev: prev, new: new).dy
     }
 
-    /// 带诊断信息的双向匹配：dy>0 内容上移（下滚）/ dy<0 内容下移（上滚）/ 0 静止 / nil 无法匹配。
-    /// 正向扫描不通过就交换角色做反向扫描。
-    static func scrollDeltaDetailed(prev: Frame, new: Frame) -> ScrollDeltaDetail {
-        let fwd = scanOneDirection(prev: prev, new: new)
-        if fwd.dy != nil { return fwd }
-        let bwd = scanOneDirection(prev: new, new: prev)
-        if let k = bwd.dy {
-            return ScrollDeltaDetail(dy: -k, fineErr: bwd.fineErr, secondErr: bwd.secondErr, tex: bwd.tex)
+    /// 正向（内容上移/下滚）：new 的上部逐行对齐 prev 的下部，找最长连续精确匹配 run。
+    /// 从满重叠往下扫，>` 严格大于「保证同分取更大重叠（= 更小位移）」。
+    private static func matchForward(prev: Frame, new: Frame, margin: Int) -> (dy: Int, overlap: Int)? {
+        let H = prev.h
+        var bestCount = 0, bestY = -1
+        let matchLimit = H / 2
+        var yNew = H - 1
+        while yNew >= 0, bestCount < matchLimit {
+            var count = 0
+            while yNew - count >= 0,
+                  rowsEqual(prev, rowA: H - 1 - count, new, rowB: yNew - count, margin: margin) {
+                count += 1
+            }
+            // 铁律：run 必须触及 new 的顶边（允许 ≤8 行缝隙给接缝噪声）——
+            // 悬浮在中间的白行 run 是幻影匹配（白底页实测：dy=65/0 的假 run 都活不过这条）
+            if count > bestCount, yNew - count < 8 { bestCount = count; bestY = yNew }
+            yNew -= 1
         }
-        return fwd  // dy=nil，保留正向诊断
+        guard bestCount > 0 else { return nil }
+        return (dy: H - 1 - bestY, overlap: bestCount)
     }
 
-    /// 单向匹配（内容上移方向）：纹理闸门（全白/低纹理候选一律不可信）+ 次优解判定
-    static func scanOneDirection(prev: Frame, new: Frame) -> ScrollDeltaDetail {
-        let none = ScrollDeltaDetail(dy: nil, fineErr: .greatestFiniteMagnitude, secondErr: .greatestFiniteMagnitude, tex: 0)
+    /// 反向（内容下移/上滚）：new 的下部逐行对齐 prev 的上部。
+    private static func matchBackward(prev: Frame, new: Frame, margin: Int) -> (prependRows: Int, overlap: Int)? {
         let H = prev.h
-        guard new.h == H, new.w == prev.w else { return none }
-        let maxDelta = H - 60
-        guard maxDelta > 0 else { return ScrollDeltaDetail(dy: 0, fineErr: 0, secondErr: 0, tex: 0) }
-        // 粗扫（步长 8），记录每个候选 dy 的误差与纹理分
-        var errs: [(dy: Int, err: Double, tex: Int)] = []
-        var dy = 0
-        while dy <= maxDelta {
-            errs.append((dy, stripError(prev: prev, new: new, dy: dy),
-                         textureScore(prev: prev, new: new, dy: dy)))
-            dy += 8
+        var bestCount = 0, bestStart = -1
+        let matchLimit = H / 2
+        var yNew = 0
+        while yNew < H, bestCount < matchLimit {
+            var count = 0
+            while yNew + count < H,
+                  rowsEqual(prev, rowA: count, new, rowB: yNew + count, margin: margin) {
+                count += 1
+            }
+            // 对称铁律：run 必须触及 new 的底边
+            if count > bestCount, yNew + count > H - 8 { bestCount = count; bestStart = yNew }
+            yNew += 1
         }
-        // 纹理闸门前置：重叠区「高对比像素」太少的候选（全白/纯色对齐）直接出局。
-        // 白底页上全白对齐 err=0 会抢到全局最优（实测 dy=340 假对齐挤出真匹配 dy=87），
-        // 必须在选优前就过滤，而不是事后否决。
-        let eligible = errs.filter { $0.tex >= 24 }
-        guard let (best, bestErr, _) = eligible.min(by: { $0.err < $1.err }) else { return none }
-        // 次优解（排除最优 ±8 邻域）：低纹理内容（纯色/渐变）各 dy 误差接近，
-        // 用「显著优于次优」防止误匹配（手滑上滚/来回滚动的关键防线）
-        let secondErr = eligible.filter { abs($0.dy - best) > 8 }.map { $0.err }.min() ?? .greatestFiniteMagnitude
-        // 精扫（±8 步长 1）——同样过纹理闸门：
-        // 粗选若恰好卡在文字边缘（err 非 0 但有纹理），不加闸门会滑进旁边的全白 err=0 假对齐
-        var fine = best, fineErr = bestErr, fineTex = textureScore(prev: prev, new: new, dy: best)
-        let lo = max(0, best - 8), hi = min(maxDelta, best + 8)
-        if lo <= hi {
-            for d in lo...hi {
-                let t = textureScore(prev: prev, new: new, dy: d)
-                guard t >= 24 else { continue }
-                let e = stripError(prev: prev, new: new, dy: d)
-                if e < fineErr { fineErr = e; fine = d; fineTex = t }
+        guard bestCount > 0 else { return nil }
+        return (prependRows: bestStart, overlap: bestCount)
+    }
+
+    /// 行级精确比较（memcmp，左右各让 margin 像素）——逐字节相等才算匹配行
+    private static func rowsEqual(_ a: Frame, rowA: Int, _ b: Frame, rowB: Int, margin: Int) -> Bool {
+        let w = a.w - margin * 2
+        guard w > 0 else { return false }
+        let offA = rowA * a.bpr + margin * 4
+        let offB = rowB * b.bpr + margin * 4
+        return a.data.withUnsafeBytes { pa in
+            b.data.withUnsafeBytes { pb in
+                memcmp(pa.baseAddress! + offA, pb.baseAddress! + offB, w * 4) == 0
             }
         }
-        let tex = fineTex
-        let decisive = fineErr < 1.5 || fineErr < 0.6 * secondErr
-        let dyOut: Int? = (fineErr < 6.0 && decisive) ? fine : nil
-        return ScrollDeltaDetail(dy: dyOut, fineErr: fineErr, secondErr: secondErr, tex: tex)
     }
 
     /// 重叠区纹理分：采样点中与右邻像素高对比（|ΔRGB| > 24）的数量
@@ -378,7 +412,7 @@ final class ScrollCaptureSession: NSObject {
     // MARK: - 调试日志（每帧匹配详情，排障用）
 
     private func debugLog(detail: ScrollDeltaDetail, appended: Int) {
-        let line = "\(Date()) dy=\(detail.dy.map(String.init) ?? "nil") err=\(String(format: "%.2f", detail.fineErr)) second=\(String(format: "%.2f", detail.secondErr)) tex=\(detail.tex) append=\(appended) bottom=\(capturedBottom)\n"
+        let line = "\(Date()) dy=\(detail.dy.map(String.init) ?? "nil") overlap=\(detail.overlap) tex=\(detail.tex) append=\(appended) bottom=\(capturedBottom)\n"
         let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-scroll.log")
         guard let d = line.data(using: .utf8) else { return }
         if let h = try? FileHandle(forWritingTo: url) {

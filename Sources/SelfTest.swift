@@ -78,6 +78,11 @@ enum SelfTest {
         let down = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(87))
         let p2 = down.dy == 87
         print("whitematch: 下滚 dy=\(down.dy.map(String.init) ?? "nil") tex=\(down.tex) -> \(p2 ? "PASS" : "FAIL")")
+        // 幻影回归（真实事故 2026-10-09：dy=660 顶满边界、err 5.95 擦边过线 → 660 行错位追加）：
+        // 大跳变两帧零重叠，精确匹配必须 nil（旧模糊匹配会瞎猜）
+        let phantom = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(1100))
+        let p3 = phantom.dy == nil
+        print("whitematch: 大跳变零重叠 dy=\(phantom.dy.map(String.init) ?? "nil") -> \(p3 ? "PASS" : "FAIL")")
     }
 
     /// 造 1600px 长图，用滑动窗口模拟滚动帧，验证匹配 + 拼接还原
