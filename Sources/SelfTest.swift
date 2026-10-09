@@ -41,6 +41,43 @@ enum SelfTest {
         // 3) 滚动拼接离线自检
         testScrollStitch(outDir: outDir)
         testWhitePageMatching(outDir: outDir)
+        testReanchor()
+    }
+
+    /// 失速重锚定自检：拼到 [0,1100) 后大幅回滚（超出帧间量程 340）→ 主匹配 nil → 重锚定找回 pos=200
+    private static func testReanchor() {
+        let W = 400, SRCH = 1600, FH = 400
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: SRCH,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep) else { print("reanchor: init FAIL"); return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        NSGradient(colors: [NSColor(srgbRed: 0.2, green: 0.3, blue: 0.5, alpha: 1),
+                            NSColor(srgbRed: 0.6, green: 0.3, blue: 0.2, alpha: 1)])!
+            .draw(in: NSRect(x: 0, y: 0, width: W, height: SRCH), angle: -90)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 20, weight: .bold),
+            .foregroundColor: NSColor.white,
+        ]
+        for y in stride(from: 10, to: SRCH - 30, by: 40) {
+            NSString(string: "row \(y)").draw(at: CGPoint(x: 20, y: CGFloat(y)), withAttributes: attrs)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let src = rep.cgImage else { return }
+        func frame(_ off: Int) -> ScrollCaptureSession.Frame {
+            ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!)
+        }
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        session.reanchorMinInterval = 0
+        for off in [0, 87, 171, 258, 345, 432, 519, 606, 700] { session.process(newFrame: frame(off)) }
+        // 大幅回滚到 200（相对上一帧 700 后退 500，超出量程 340）→ 主匹配必 nil → 重锚定应找回
+        session.process(newFrame: frame(200))
+        let ok = session.debugLastPos == 200
+        print("reanchor: 大幅回滚后 lastPos=\(session.debugLastPos)（期望 200）-> \(ok ? "PASS" : "FAIL")")
     }
 
     /// 白底稀疏文本页：上滚（手滑）必须 nil（幻影 dy 会重复拼接）；正常下滚仍正确匹配

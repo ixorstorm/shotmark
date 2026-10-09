@@ -14,6 +14,28 @@ final class ScrollCaptureSession: NSObject {
         let h: Int
         let bpr: Int
 
+        /// 降采样构造（重锚定粗搜用）：把 cg 画进 scale 倍小位图
+        init(_ cg: CGImage, downscale: CGFloat) {
+            let w = max(1, Int((CGFloat(cg.width) * downscale).rounded()))
+            let h = max(1, Int((CGFloat(cg.height) * downscale).rounded()))
+            let bpr = w * 4
+            var d = Data(count: h * bpr)
+            d.withUnsafeMutableBytes { ptr in
+                guard let base = ptr.baseAddress,
+                      let ctx = CGContext(data: base, width: w, height: h,
+                                          bitsPerComponent: 8, bytesPerRow: bpr,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+                ctx.interpolationQuality = .high
+                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            }
+            self.cg = cg
+            self.w = w
+            self.h = h
+            self.bpr = bpr
+            self.data = d
+        }
+
         init(_ cg: CGImage) {
             let w = cg.width
             let h = cg.height
@@ -62,6 +84,14 @@ final class ScrollCaptureSession: NSObject {
     private var lastPos = 0
     /// 每次 process 的匹配 dy（含 nil），自检调试用
     var debugDys: [Int?] = []
+    /// 自检用：当前锚定位置
+    var debugLastPos: Int { lastPos }
+    /// 自检时关掉落盘日志（避免污染正式 shotmark-scroll.log）
+    var loggingEnabled = true
+    /// 重锚定缓存（segments 变化即失效）
+    private var accCache: (cg: CGImage, small: Frame, top: Int, bottom: Int)?
+    var reanchorMinInterval: Double = 1.2   // 测试可设 0
+    private var lastReanchorAt = Date.distantPast
     /// 已销毁：阻断 finish/cancel 重入与 in-flight 抓帧复活窗口
     private var tornDown = false
 
@@ -123,6 +153,78 @@ final class ScrollCaptureSession: NSObject {
         }
     }
 
+    /// 失速自救：把当前帧到整幅已拼长图里重锚定。
+    /// 用户快滚甩过头（位移超出帧间量程）后，只要回滚到已拼过的任何位置，就能认出并续接。
+    /// 粗搜在 1/4 降采样长图上做（步长 8 小行 = 32 全行），命中后用既有的全分辨率闸门匹配器验证。
+    private func tryReanchor(nf: Frame) -> (Frame, Int, ScrollDeltaDetail)? {
+        guard Date().timeIntervalSince(lastReanchorAt) > reanchorMinInterval else { return nil }
+        let totalH = capturedBottom - capturedTop
+        guard totalH > nf.h else { return nil }   // 长图还没一帧高，无从锚起
+        lastReanchorAt = Date()
+
+        // 缓存失效则重建（compose 一次不便宜，仅失速时来）
+        if accCache == nil {
+            guard let img = compose(), let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+            accCache = (cg, Frame(cg, downscale: 0.25), capturedTop, capturedBottom)
+        }
+        guard let acc = accCache, acc.top == capturedTop, acc.bottom == capturedBottom else { return nil }
+
+        let accSmall = acc.small
+        let fSmall = Frame(nf.cg, downscale: 0.25)
+        let smallH = fSmall.h
+        let accRows = accSmall.h
+        let minOv = smallH / 4
+        guard accRows >= smallH + 8 else { return nil }
+
+        // 粗搜：在长图（小尺度）上滑窗找最优位置
+        var bestOff = -1, bestErr = Double.greatestFiniteMagnitude
+        var off = 0
+        let maxOff = accRows - smallH
+        while off <= maxOff {
+            let e = Self.errAtOffset(acc: accSmall, nf: fSmall, off: off)
+            if e < bestErr { bestErr = e; bestOff = off }
+            off += 8
+        }
+        guard bestOff >= 0, bestErr < 8.0 else { return nil }
+
+        // 全分辨率验证：裁长图对应切片，走既有的五闸门匹配器
+        let pos = capturedTop + bestOff * 4
+        let sliceTop = min(max(capturedTop, pos - 32), capturedBottom - nf.h)
+        guard let sliceCG = acc.cg.cropping(to: CGRect(x: 0, y: sliceTop - capturedTop, width: nf.w, height: nf.h)) else { return nil }
+        let sliceFrame = Frame(sliceCG)
+        let detail = Self.scrollDeltaDetailed(prev: sliceFrame, new: nf)
+        guard detail.dy != nil else { return nil }
+        return (sliceFrame, sliceTop, detail)
+    }
+
+    /// 小尺度偏置误差：acc 的 [off, off+nf.h) vs nf 的 [0, nf.h)
+    private static func errAtOffset(acc: Frame, nf: Frame, off: Int) -> Double {
+        let overlap = nf.h
+        let rowStep = max(1, overlap / 48)
+        let colStep = max(2, nf.w / 64)
+        var sum = 0.0, n = 0.0
+        acc.data.withUnsafeBytes { aBuf in
+            nf.data.withUnsafeBytes { nBuf in
+                let a = aBuf.bindMemory(to: UInt8.self)
+                let b = nBuf.bindMemory(to: UInt8.self)
+                var r = 0
+                while r < overlap {
+                    let ar = (off + r) * acc.bpr
+                    let nr = r * nf.bpr
+                    var c = 0
+                    while c < nf.w {
+                        let i = ar + c * 4, j = nr + c * 4
+                        sum += Double(abs(Int(a[i]) - Int(b[j])) + abs(Int(a[i+1]) - Int(b[j+1])) + abs(Int(a[i+2]) - Int(b[j+2])))
+                        n += 3
+                        c += colStep
+                    }
+                    r += rowStep
+                }
+            }
+        }
+        return n > 0 ? sum / n : .greatestFiniteMagnitude
+    }
+
     /// 位移大 = 用户在快滚 → 抓帧提速到 70ms；慢下来回 150ms。
     /// 否则惯性滚动的单拍位移会超出匹配量程（maxDelta），永失衔接（静默丢内容）。
     private func adaptTickRate(matchedDy: Int, frameH: Int) {
@@ -167,15 +269,30 @@ final class ScrollCaptureSession: NSObject {
         let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
         debugDys.append(detail.dy)
         guard let dy = detail.dy else {
-            // 失速预警：连续 5 拍配不上且内容确实在变（dy=0 处误差大）→ 提示回滚衔接
+            // 失速自救：先尝试把当前帧到「整幅已拼长图」里重锚定（用户回滚到已拼区域即可续命）。
+            // 锚不上才计失速——连续 5 拍且内容确实在变 → 提示回滚衔接
+            if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
+                lastFrame = slice
+                lastPos = pos
+                let ap = applyMatch(dy: dy2, nf: nf)
+                debugLog(detail: d2, appended: ap)
+                return
+            }
             let staticErr = Self.stripError(prev: prev, new: nf, dy: 0)
             nilStreak = staticErr > 8 ? nilStreak + 1 : 0
             borderView?.warning = nilStreak >= 5
-                ? "滚动过快，衔接可能丢失 · 建议回滚到蓝框内最后画面再慢滚"
+                ? "衔接丢失 · 回滚到已拼过的画面即可自动续接"
                 : nil
             debugLog(detail: detail, appended: 0)
             return   // 未匹配（滚动过快/低纹理）：保持 prev，下拍重试
         }
+        let appended = applyMatch(dy: dy, nf: nf)
+        debugLog(detail: detail, appended: appended)
+    }
+
+    /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
+    @discardableResult
+    private func applyMatch(dy: Int, nf: Frame) -> Int {
         nilStreak = 0
         borderView?.warning = nil
         let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
@@ -205,13 +322,14 @@ final class ScrollCaptureSession: NSObject {
             }
         }
         if appended > 0 {
+            accCache = nil                          // 长图变了，重锚定缓存失效
             borderView?.progress = capturedBottom - capturedTop
             updatePreview()
         }
         adaptTickRate(matchedDy: abs(dy), frameH: nf.h)
-        debugLog(detail: detail, appended: appended)
         lastPos = p
         lastFrame = nf
+        return appended
     }
 
     // MARK: - 拼接
@@ -418,6 +536,7 @@ final class ScrollCaptureSession: NSObject {
     // MARK: - 调试日志（每帧匹配详情，排障用）
 
     private func debugLog(detail: ScrollDeltaDetail, appended: Int) {
+        guard loggingEnabled else { return }
         let line = "\(Date()) dy=\(detail.dy.map(String.init) ?? "nil") err=\(String(format: "%.2f", detail.fineErr)) second=\(String(format: "%.2f", detail.secondErr)) tex=\(detail.tex) append=\(appended) bottom=\(capturedBottom)\n"
         let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-scroll.log")
         guard let d = line.data(using: .utf8) else { return }
