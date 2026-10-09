@@ -128,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            styleMask: [.titled, .closable, .resizable, .miniaturizable],
                            backing: .buffered, defer: false)
         win.title = "ShotMark 钉图"
+        win.isReleasedWhenClosed = false   // 默认 true：close 自释放 + 数组持有 = 双重释放崩溃
         let iv = NSImageView(image: img)
         iv.imageScaling = .scaleProportionallyUpOrDown
         win.contentView = iv
@@ -219,6 +220,7 @@ extension AppDelegate: ShotViewDelegate {
         win.level = .floating
         win.isOpaque = false
         win.backgroundColor = .clear
+        win.isReleasedWhenClosed = false   // 同上，防双重释放
         let bg = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         bg.wantsLayer = true
         bg.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.92).cgColor

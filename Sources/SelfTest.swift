@@ -70,9 +70,9 @@ enum SelfTest {
         func frame(_ off: Int) -> ScrollCaptureSession.Frame {
             ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!)
         }
-        // 上滚（内容下移）：白对白的幻影对齐必须被拒
+        // 上滚（内容下移）：应识别为反向 -87（真匹配，不是幻影）；幻影的防法在「全白对齐被纹理闸门过滤」
         let up = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(258), new: frame(171))
-        let p1 = up.dy == nil
+        let p1 = up.dy == -87
         print("whitematch: 上滚 dy=\(up.dy.map(String.init) ?? "nil") tex=\(up.tex) -> \(p1 ? "PASS" : "FAIL")")
         // 正常下滚：稀疏文本提供足够纹理，仍应正确匹配
         let down = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(87))
@@ -104,15 +104,15 @@ enum SelfTest {
         NSGraphicsContext.restoreGraphicsState()
         guard let srcCG = srcRep.cgImage else { print("stitch: src FAIL"); return }
 
-        // 模拟滚动（含手滑场景：下滚→上滚→回到原位→继续下滚）：
+        // 模拟双向滚动：下滚 → 上滚回原位（已覆盖，不动）→ 继续上滚越过首帧（前插）
         // 帧 i = 源图 [off_i, off_i+FH)（CGImage.cropping 原点左上）
-        let offsets = [0, 87, 171, 258, 171, 258, 345]
+        let offsets = [171, 258, 171, 87, 0]
         let frames: [ScrollCaptureSession.Frame] = offsets.compactMap { off in
             srcCG.cropping(to: CGRect(x: 0, y: off, width: W, height: FH)).map { ScrollCaptureSession.Frame($0) }
         }
         guard frames.count == offsets.count else { print("stitch: frames FAIL"); return }
 
-        // 用真实会话驱动（水位线去重逻辑）
+        // 用真实会话驱动（双向水位线逻辑）
         var result: NSImage?
         let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
                                            regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { img in
@@ -125,15 +125,15 @@ enum SelfTest {
               let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             print("stitch: compose FAIL"); return
         }
-        // 期望：上滚和回原位不追加内容，最终覆盖源图 [0, 345+FH) 共 745 行
-        let expectH = FH + 345
+        // 期望：覆盖源图 [0, 258+FH) 共 658 行（上滚越过首帧的内容被前插进来）
+        let expectH = FH + 258
         guard let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: expectH)) else {
             print("stitch: ref FAIL"); return
         }
         let err = ScrollCaptureSession.stripError(prev: ScrollCaptureSession.Frame(composedCG),
                                                   new: ScrollCaptureSession.Frame(refCG), dy: 0)
         let pass = composedCG.height == expectH && err < 3.0
-        print("stitch: 来回滚动 offsets=\(offsets) 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
+        print("stitch: 双向滚动 offsets=\(offsets) 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
         let out = NSImage(size: NSSize(width: W, height: composedCG.height))
         out.addRepresentation(NSBitmapImageRep(cgImage: composedCG))
         Render.writePNG(out, to: outDir.appendingPathComponent("scroll-stitch.png"))

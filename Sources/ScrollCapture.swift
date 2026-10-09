@@ -50,11 +50,13 @@ final class ScrollCaptureSession: NSObject {
 
     private var firstFrame: Frame?
     private var lastFrame: Frame?
-    private var strips: [CGImage] = []
+    /// 已捕获片段（pos = 片段顶部绝对行位置，相对第一帧顶部；支持负值 = 上滚前插）
+    private var segments: [(pos: Int, cg: CGImage)] = []
     private var pointScale: CGFloat = 2
-    /// 水位线：已拼接内容的底部（像素行，相对第一帧顶部）与上一帧的绝对顶部位置。
-    /// 支持来回滚动（手滑上滚/上下反复）——新帧只有超出水位线的部分才会被追加，杜绝重复拼接。
+    /// 水位线：已拼接内容的底部/顶部（像素行，相对第一帧顶部）与上一帧的绝对顶部位置。
+    /// 支持来回滚动（手滑上滚/上下反复）——新帧只有超出水位线的部分才会被拼接，杜绝重复。
     private var capturedBottom = 0
+    private var capturedTop = 0
     private var lastPos = 0
     /// 每次 process 的匹配 dy（含 nil），自检调试用
     var debugDys: [Int?] = []
@@ -135,7 +137,9 @@ final class ScrollCaptureSession: NSObject {
             firstFrame = nf
             lastFrame = nf
             pointScale = CGFloat(nf.w) / regionPts.width
+            segments = [(0, nf.cg)]
             capturedBottom = nf.h
+            capturedTop = 0
             lastPos = 0
             updatePreview(force: true)      // 第一帧即出预览
             return
@@ -143,21 +147,41 @@ final class ScrollCaptureSession: NSObject {
         guard let prev = lastFrame else { return }
         let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
         debugDys.append(detail.dy)
-        debugLog(detail: detail, appended: 0)
-        guard let dy = detail.dy else { return }  // 未匹配（上滚/滚动过快/低纹理）：保持 prev，下拍重试
-        let p = lastPos + dy                       // 本帧顶部的绝对位置
-        let start = capturedBottom - p             // 帧内「新内容」起始行
-        if start < nf.h {                          // 有超出水位线的新内容
-            let s = max(0, start)
-            if s < nf.h,
-               let strip = nf.cg.cropping(to: CGRect(x: 0, y: s, width: nf.w, height: nf.h - s)) {
-                strips.append(strip)
-                capturedBottom = p + nf.h
-                borderView?.progress = capturedBottom
-                updatePreview()
-                debugLog(detail: detail, appended: nf.h - s)
+        guard let dy = detail.dy else {
+            debugLog(detail: detail, appended: 0)
+            return   // 未匹配（滚动过快/低纹理）：保持 prev，下拍重试
+        }
+        let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
+        var appended = 0
+        if dy >= 0 {
+            // 底部追加超出水位线的部分
+            let start = capturedBottom - p
+            if start < nf.h {
+                let s = max(0, start)
+                if s < nf.h,
+                   let strip = nf.cg.cropping(to: CGRect(x: 0, y: s, width: nf.w, height: nf.h - s)) {
+                    segments.append((p + s, strip))
+                    capturedBottom = max(capturedBottom, p + nf.h)
+                    appended = nf.h - s
+                }
+            }
+        } else {
+            // 用户上滚：顶部前插水位线之上的新内容
+            let headRows = capturedTop - p
+            if headRows > 0 {
+                let take = min(headRows, nf.h)
+                if let strip = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: take)) {
+                    segments.append((p, strip))
+                    capturedTop = min(capturedTop, p)
+                    appended = take
+                }
             }
         }
+        if appended > 0 {
+            borderView?.progress = capturedBottom - capturedTop
+            updatePreview()
+        }
+        debugLog(detail: detail, appended: appended)
         lastPos = p
         lastFrame = nf
     }
@@ -165,13 +189,15 @@ final class ScrollCaptureSession: NSObject {
     // MARK: - 拼接
 
     private func compose() -> NSImage? {
-        guard let first = firstFrame else { return nil }
-        return Self.compose(first: first.cg, strips: strips, pointScale: pointScale)
+        guard !segments.isEmpty else { return nil }
+        return Self.compose(segments: segments, top: capturedTop, bottom: capturedBottom, pointScale: pointScale)
     }
 
-    static func compose(first: CGImage, strips: [CGImage], pointScale: CGFloat) -> NSImage? {
-        let w = first.width
-        let totalH = first.height + strips.reduce(0) { $0 + $1.height }
+    /// segments（pos = 片段顶部绝对位置）按位置堆叠成完整长图
+    static func compose(segments: [(pos: Int, cg: CGImage)], top: Int, bottom: Int, pointScale: CGFloat) -> NSImage? {
+        guard let first = segments.first else { return nil }
+        let w = first.cg.width
+        let totalH = bottom - top
         guard totalH > 0,
               let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
                                          pixelsWide: w, pixelsHigh: totalH,
@@ -183,21 +209,20 @@ final class ScrollCaptureSession: NSObject {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = ctx
         ctx.imageInterpolation = .high
-        // AppKit y-up：首帧贴顶（y = totalH - first.height），后续条带依次向下堆
-        let wf = CGFloat(first.width)
-        var y = CGFloat(totalH) - CGFloat(first.height)
-        NSImage(cgImage: first, size: NSSize(width: wf, height: CGFloat(first.height)))
-            .draw(in: NSRect(x: 0, y: y, width: wf, height: CGFloat(first.height)))
-        for s in strips {
-            y -= CGFloat(s.height)
-            NSImage(cgImage: s, size: NSSize(width: wf, height: CGFloat(s.height)))
-                .draw(in: NSRect(x: 0, y: y, width: wf, height: CGFloat(s.height)))
+        let wf = CGFloat(w)
+        for seg in segments {
+            let h = seg.cg.height
+            // AppKit y-up：pos 越小越靠上 → y = totalH - (pos - top) - h
+            let y = totalH - (seg.pos - top) - h
+            NSImage(cgImage: seg.cg, size: NSSize(width: wf, height: CGFloat(h)))
+                .draw(in: NSRect(x: 0, y: CGFloat(y), width: wf, height: CGFloat(h)))
         }
         NSGraphicsContext.restoreGraphicsState()
         let img = NSImage(size: NSSize(width: wf / pointScale, height: CGFloat(totalH) / pointScale))
         img.addRepresentation(rep)
         return img
     }
+
 
     // MARK: - 帧间匹配（static，便于离线自检）
 
@@ -213,8 +238,20 @@ final class ScrollCaptureSession: NSObject {
         scrollDeltaDetailed(prev: prev, new: new).dy
     }
 
-    /// 带诊断信息的匹配：纹理闸门（全白/低纹理候选一律不可信）+ 次优解判定
+    /// 带诊断信息的双向匹配：dy>0 内容上移（下滚）/ dy<0 内容下移（上滚）/ 0 静止 / nil 无法匹配。
+    /// 正向扫描不通过就交换角色做反向扫描。
     static func scrollDeltaDetailed(prev: Frame, new: Frame) -> ScrollDeltaDetail {
+        let fwd = scanOneDirection(prev: prev, new: new)
+        if fwd.dy != nil { return fwd }
+        let bwd = scanOneDirection(prev: new, new: prev)
+        if let k = bwd.dy {
+            return ScrollDeltaDetail(dy: -k, fineErr: bwd.fineErr, secondErr: bwd.secondErr, tex: bwd.tex)
+        }
+        return fwd  // dy=nil，保留正向诊断
+    }
+
+    /// 单向匹配（内容上移方向）：纹理闸门（全白/低纹理候选一律不可信）+ 次优解判定
+    static func scanOneDirection(prev: Frame, new: Frame) -> ScrollDeltaDetail {
         let none = ScrollDeltaDetail(dy: nil, fineErr: .greatestFiniteMagnitude, secondErr: .greatestFiniteMagnitude, tex: 0)
         let H = prev.h
         guard new.h == H, new.w == prev.w else { return none }
@@ -330,6 +367,7 @@ final class ScrollCaptureSession: NSObject {
         win.backgroundColor = .clear
         win.ignoresMouseEvents = true
         win.sharingType = .none          // 对截屏隐身，边框不入长图
+        win.isReleasedWhenClosed = false // 默认 true：close() 会自释放，属性再 nil 化 = 双重释放 → pool-pop SIGSEGV
         let bv = ScrollBorderView(frame: NSRect(origin: .zero, size: frame.size))
         win.contentView = bv
         borderView = bv
@@ -383,6 +421,7 @@ final class ScrollCaptureSession: NSObject {
         win.backgroundColor = .clear
         win.ignoresMouseEvents = true
         win.sharingType = .none          // 预览窗也不入长图
+        win.isReleasedWhenClosed = false // 同上，防双重释放
         let bg = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
         bg.wantsLayer = true
         bg.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.85).cgColor
