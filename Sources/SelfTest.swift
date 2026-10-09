@@ -6,6 +6,7 @@ import AppKit
 enum SelfTest {
 
     static var enabled: Bool { CommandLine.arguments.contains("--selftest") }
+    static var liveEnabled: Bool { CommandLine.arguments.contains("--selftest-live") }
 
     static func run() {
         let outDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-selftest")
@@ -42,6 +43,24 @@ enum SelfTest {
         testScrollStitch(outDir: outDir)
         testWhitePageMatching(outDir: outDir)
         testReanchor()
+        if CommandLine.arguments.contains("--selftest-live") { testLiveSession() }
+    }
+
+    /// 真机冒烟（--selftest-live）：真定时器 + 真 SCK 抓帧 + 真会话。
+    /// 专治「自检全绿但真机不跑」——定时器/权限/抓帧链路只有这条路能覆盖
+    ///（事故 2026-10-09：scheduleTimer 初值守卫吃掉初始定时器，自检全绿但真机永不拼接）。
+    private static func testLiveSession() {
+        guard let screen = NSScreen.main else { print("live: no screen FAIL"); return }
+        let region = CGRect(x: screen.frame.midX - 400, y: screen.frame.midY - 250, width: 800, height: 500)
+        let session = ScrollCaptureSession(screen: screen, regionPts: region) { _ in }
+        session.loggingEnabled = false
+        session.start()
+        // 主线程 runloop 转 1.6s（150ms 拍应抓 ~10 帧）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            let n = session.debugDys.count
+            session.cancel()
+            print("live: 1.6s 内抓帧处理 \(n) 拍（期望 ≥4）-> \(n >= 4 ? "PASS" : "FAIL")")
+        }
     }
 
     /// 失速重锚定自检：拼到 [0,1100) 后大幅回滚（超出帧间量程 340）→ 主匹配 nil → 重锚定找回 pos=200

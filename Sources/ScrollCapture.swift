@@ -67,7 +67,7 @@ final class ScrollCaptureSession: NSObject {
     private weak var previewImgView: NSImageView?
     private var lastPreviewAt = Date.distantPast
     private var timer: Timer?
-    private var tickInterval: Double = 0.15   // 速度自适应：滚得快就抓得快
+    private var tickInterval: Double = 0   // 速度自适应：滚得快就抓得快。初值必须是 0——若等于首个调度值，scheduleTimer 的「没变不重建」守卫会把初始定时器吃掉（实测事故：滚动会话定时器从未创建，只有第一帧处理，永不拼接）
     private var capturing = false
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var nilStreak = 0                  // 连续配不上且内容在变的拍数（失速预警）

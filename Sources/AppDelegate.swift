@@ -25,7 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if SelfTest.enabled {
             SelfTest.run()
-            NSApp.terminate(nil)
+            if SelfTest.liveEnabled {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { NSApp.terminate(nil) }  // 等真机冒烟跑完
+            } else {
+                NSApp.terminate(nil)
+            }
             return
         }
     }
