@@ -536,8 +536,15 @@ final class ShotView: NSView {
     // MARK: - 文字标注
 
     func startText(at p: CGPoint) {   // internal：自检可达
-        let tf = NSTextField(frame: NSRect(x: p.x, y: p.y - 13, width: 280, height: 28))
-        tf.font = NSFont.systemFont(ofSize: 14 + lineWidth * 2, weight: .medium)
+        let fontSize = 14 + lineWidth * 2
+        let inkH = fontSize * 0.72                    // 墨迹高度近似（实测 20pt 字 ≈ 14pt）
+        let fieldH = ceil(fontSize * 1.45)
+        // 基线对齐：draw(at: p) 的墨迹下沿 = p.y + 6（实测），
+        // 框内墨迹下沿 = fieldY + (fieldH - inkH)/2 → 反解 fieldY。
+        // 否则提交瞬间文字会「往上跳一节」（用户实测反馈）
+        let fieldY = p.y + 6 - (fieldH - inkH) / 2
+        let tf = NSTextField(frame: NSRect(x: p.x - 3, y: fieldY, width: 280, height: fieldH))
+        tf.font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         tf.textColor = color
         tf.isBordered = false
         tf.drawsBackground = false   // 飞书同款：直接打字，无底衬
@@ -582,6 +589,24 @@ final class ShotView: NSView {
         trackingAreaRef = t
     }
 
+    /// 手柄悬停光标：双向箭头（macOS 对角线缩放光标是私有 selector，取不到退回十字）
+    private func setResizeCursor(handle i: Int) {
+        // 0=左下 1=下中 2=右下 3=右中 4=右上 5=上中 6=左上 7=左中；标注手柄 0-3 同序四角
+        switch i {
+        case 1, 5: NSCursor.resizeUpDown.set()
+        case 3, 7: NSCursor.resizeLeftRight.set()
+        case 0, 4: Self.diagonalResizeCursor(nesw: true)?.set() ?? NSCursor.crosshair.set()
+        default:   Self.diagonalResizeCursor(nesw: false)?.set() ?? NSCursor.crosshair.set()
+        }
+    }
+
+    private static func diagonalResizeCursor(nesw: Bool) -> NSCursor? {
+        let name = nesw ? "_windowResizeNorthEastSouthWestCursor" : "_windowResizeNorthWestSouthEastCursor"
+        let sel = NSSelectorFromString(name)
+        guard NSCursor.responds(to: sel) else { return nil }
+        return NSCursor.perform(sel)?.takeUnretainedValue() as? NSCursor
+    }
+
     override func mouseMoved(with event: NSEvent) {
         let p = event.locationInWindow
         if let sel = selection {
@@ -606,6 +631,14 @@ final class ShotView: NSView {
                 return
             }
             hideHoverTip()
+            // 选区手柄 → 双箭头
+            if let h = handleIndex(at: p, sel: sel) { setResizeCursor(handle: h); return }
+            // 选中标注的手柄 → 双箭头
+            if let idx = selectedAnn, idx < annotations.count,
+               let h = annHandleRects(annotations[idx].bounds).firstIndex(where: { $0.insetBy(dx: -3, dy: -3).contains(p) }) {
+                setResizeCursor(handle: h)
+                return
+            }
             if sel.contains(p) {
                 if hitAnnotation(p) != nil { NSCursor.openHand.set(); return }
                 (tool == .text ? NSCursor.iBeam : NSCursor.crosshair).set()
