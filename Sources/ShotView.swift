@@ -419,7 +419,7 @@ final class ShotView: NSView {
         tf.isBordered = false
         tf.drawsBackground = false   // 飞书同款：直接打字，无底衬
         tf.focusRingType = .none
-        tf.placeholderString = "输入文字，回车确认"
+        // 无 placeholder、无底衬、无边框——落点处只有光标闪动（飞书同款）
         tf.target = self
         tf.action = #selector(commitTextAction(_:))
         addSubview(tf)
