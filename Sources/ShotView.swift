@@ -541,8 +541,8 @@ final class ShotView: NSView {
         // 基线对齐（实测校准，bitmap 墨迹逐像素测的）：
         // draw(at: p) 墨迹下沿 = p.y + 4；框墨迹下沿 = fieldY + fontSize*0.45
         // → fieldY = p.y - fontSize*0.25。偏了就会「提交瞬间文字跳位」
-        let fieldY = p.y - fontSize * 0.25
-        let tf = NSTextField(frame: NSRect(x: p.x - 3, y: fieldY, width: 280, height: fieldH))
+        let fieldY = p.y - fontSize * 0.25 - 0.5   // -0.5：残差居中（实测 dy 残差 0~-1px）
+        let tf = NSTextField(frame: NSRect(x: p.x - 2, y: fieldY, width: 280, height: fieldH))  // -2：水平残差 -1px 校准
         tf.font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         // 长文字不折行：随输入自动变宽（不换行），最宽到选区右缘
         tf.cell?.wraps = false
