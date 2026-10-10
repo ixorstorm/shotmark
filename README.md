@@ -1,8 +1,10 @@
 # ShotMark — macOS 截图标注工具（对标飞书截图）
 
+> A native macOS screenshot + annotation tool in pure Swift/AppKit — global hotkey, arrows/rects/mosaic/text, **scrolling capture with live stitch preview**, copy-to-clipboard. Zero dependencies, builds with `swiftc` alone (no Xcode needed).
+
 > **类型: 研究（工具类）** | 状态: active | 定位: 截图 + 标注一步完成，回车即进剪贴板
 > 2026-10-08 建（用户明确要求立项）。Swift/AppKit 原生，`swiftc` 直编，零第三方依赖。
-> 机型约束：arm64 macOS 14+（开发机 guns-roses，macOS 26.6.2 实测）。
+> 机型约束：arm64 macOS 14+。
 
 一句话：按 **⌃⇧A** → 拖选区域 → 画圈/箭头/打码/写字 → **回车进剪贴板**，全程不落地任何文件。
 
@@ -32,12 +34,13 @@
 ## 安装与使用
 
 ```bash
-cd work/shotmark
 make            # 编译出 ShotMark.app（swiftc 直出，无 Xcode 工程，CLT 即可）
-make selftest   # 渲染自检：写 /tmp 下 export.png（导出图）+ view.png（完整界面图）
+make selftest   # 渲染自检：写 $TMPDIR 下 export.png（导出图）+ view.png（完整界面图）
 make install    # 拷到 ~/Applications/
 open ~/Applications/ShotMark.app
 ```
+
+首次使用需授予「屏幕录制」权限（系统设置 → 隐私与安全性 → 屏幕录制与系统录音）。
 
 1. 首次按 ⌃⇧A 会触发**屏幕录制权限**弹窗：系统设置 → 隐私与安全性 → 屏幕录制与系统录音 → 勾选 ShotMark，重启 App 后再按热键。
 2. 覆盖层出现后：拖选 → 点工具（圈/箭头/笔/字/码）→ 在选区内画 → ✓ 或回车复制。
