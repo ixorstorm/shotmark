@@ -59,6 +59,7 @@ final class ScrollCaptureSession: NSObject {
 
     private let screen: NSScreen
     private let regionPts: CGRect          // 屏内点坐标（AppKit y-up）
+    private let snapshot: NSImage?         // 会话开始时的全屏快照（暗色层用，nil = 不画暗色层）
     private let onFinish: (NSImage?) -> Void
 
     private var borderWin: NSWindow?
@@ -95,9 +96,10 @@ final class ScrollCaptureSession: NSObject {
     /// 已销毁：阻断 finish/cancel 重入与 in-flight 抓帧复活窗口
     private var tornDown = false
 
-    init(screen: NSScreen, regionPts: CGRect, onFinish: @escaping (NSImage?) -> Void) {
+    init(screen: NSScreen, regionPts: CGRect, snapshot: NSImage? = nil, onFinish: @escaping (NSImage?) -> Void) {
         self.screen = screen
         self.regionPts = regionPts
+        self.snapshot = snapshot
         self.onFinish = onFinish
     }
 
@@ -105,6 +107,8 @@ final class ScrollCaptureSession: NSObject {
 
     func start() {
         showBorder()
+        // 清单缓存作废：边框窗刚刚创建，抓帧的排除列表必须带上它（否则会把自己抓进长图）
+        Capture.invalidateContentCache()
         hotKeyRefs = HotKey.registerRaw(keys: [49, 36, 53]) { [weak self] code in
             guard let self = self else { return }
             if code == 53 { self.cancel() } else { self.finish() }
@@ -510,28 +514,6 @@ final class ScrollCaptureSession: NSObject {
         return n > 0 ? sum / n : .greatestFiniteMagnitude
     }
 
-    // MARK: - 边框提示窗
-
-    private func showBorder() {
-        let padX: CGFloat = 6, padTop: CGFloat = 34
-        let frame = CGRect(x: screen.frame.minX + regionPts.minX - padX,
-                           y: screen.frame.minY + regionPts.minY - padX,
-                           width: regionPts.width + padX * 2,
-                           height: regionPts.height + padX * 2 + padTop)
-        let win = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        win.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
-        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        win.isOpaque = false
-        win.backgroundColor = .clear
-        win.ignoresMouseEvents = true
-        win.sharingType = .none          // 对截屏隐身，边框不入长图
-        win.isReleasedWhenClosed = false // 默认 true：close() 会自释放，属性再 nil 化 = 双重释放 → pool-pop SIGSEGV
-        let bv = ScrollBorderView(frame: NSRect(origin: .zero, size: frame.size))
-        win.contentView = bv
-        borderView = bv
-        win.orderFrontRegardless()
-        borderWin = win
-    }
 
     // MARK: - 调试日志（每帧匹配详情，排障用）
 
@@ -545,6 +527,27 @@ final class ScrollCaptureSession: NSObject {
         } else {
             try? d.write(to: url)
         }
+    }
+
+    // MARK: - 全屏暗色层（含选区挖洞 + 边框 + 提示条）
+
+    /// 与截图覆盖层交互一致：全屏静态快照 + 选区外暗色 + 选区挖洞（洞内是实时滚动的真内容）。
+    /// 窗口 ignoresMouseEvents（滚轮/点击穿透给下方 App）+ sharingType=.none + 清单排除，三保险不入长图。
+    private func showBorder() {
+        let win = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        win.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.ignoresMouseEvents = true
+        win.sharingType = .none
+        win.isReleasedWhenClosed = false // 默认 true：close() 会自释放，属性再 nil 化 = 双重释放 → pool-pop SIGSEGV
+        let bv = ScrollBorderView(frame: NSRect(origin: .zero, size: screen.frame.size),
+                                  region: regionPts, snapshot: snapshot)
+        win.contentView = bv
+        borderView = bv
+        win.orderFrontRegardless()
+        borderWin = win
     }
 
     // MARK: - 实时拼接预览窗（对标飞书）
@@ -595,8 +598,11 @@ final class ScrollCaptureSession: NSObject {
     }
 }
 
-/// 选区边框（虚线蓝）+ 顶部操作提示（含已拼接长度）
+/// 全屏暗色层：静态快照 + 选区挖洞 + 虚线边框（外移 3pt，线宽不压选区）+ 提示条
 final class ScrollBorderView: NSView {
+    let region: CGRect            // 选区（视图坐标 = 屏内点坐标）
+    let snapshot: NSImage?
+
     var progress: Int = 0 {
         didSet { needsDisplay = true }
     }
@@ -605,8 +611,35 @@ final class ScrollBorderView: NSView {
         didSet { needsDisplay = true }
     }
 
+    init(frame f: NSRect, region: CGRect, snapshot: NSImage?) {
+        self.region = region
+        self.snapshot = snapshot
+        super.init(frame: f)
+    }
+    required init?(coder: NSCoder) { fatalError("not supported") }
+
     override func draw(_ dirtyRect: NSRect) {
-        // 顶部提示条
+        // 静态快照 + 暗色都只画在选区外（选区内必须真透明，露出下方实时滚动的内容）
+        NSGraphicsContext.saveGraphicsState()
+        let outside = NSBezierPath(rect: bounds)
+        outside.append(NSBezierPath(rect: region))
+        outside.windingRule = .evenOdd
+        outside.addClip()
+        snapshot?.draw(in: bounds)
+        NSColor.black.withAlphaComponent(0.45).setFill()
+        NSBezierPath(rect: bounds).fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        // 虚线边框：整体外移 3pt，2pt 线宽完全落在选区外（不再被截进长图）
+        let br = region.insetBy(dx: -3, dy: -3)
+        let path = NSBezierPath(rect: br)
+        let dash: [CGFloat] = [8, 6]
+        path.setLineDash(dash, count: 2, phase: 0)
+        NSColor(srgbRed: 0.13, green: 0.59, blue: 0.95, alpha: 1).setStroke()
+        path.lineWidth = 2
+        path.stroke()
+
+        // 提示条：贴选区上边，没地方就放下边
         let hint = warning ?? (progress > 0
             ? "滚动截屏中 · 已拼 \(progress)px · 空格/回车 完成 · Esc 取消"
             : "滚动截屏进行中 · 滚动滚轮 · 空格/回车 完成 · Esc 取消")
@@ -615,19 +648,14 @@ final class ScrollBorderView: NSView {
             .foregroundColor: NSColor.white,
         ]
         let ts = NSString(string: hint).size(withAttributes: attrs)
-        let bar = NSRect(x: bounds.midX - ts.width / 2 - 10, y: bounds.maxY - 30,
-                         width: ts.width + 20, height: 24)
+        let barW = ts.width + 20
+        let bx = min(max(8, region.midX - barW / 2), bounds.width - barW - 8)
+        var by = br.maxY + 8
+        if by + 24 > bounds.height - 8 { by = br.minY - 32 }
+        let bar = NSRect(x: bx, y: by, width: barW, height: 24)
         (warning == nil ? NSColor(white: 0.1, alpha: 0.9)
                         : NSColor(srgbRed: 0.75, green: 0.2, blue: 0.18, alpha: 0.95)).setFill()
         NSBezierPath(roundedRect: bar, xRadius: 7, yRadius: 7).fill()
         NSString(string: hint).draw(at: CGPoint(x: bar.minX + 10, y: bar.minY + 5), withAttributes: attrs)
-        // 虚线边框
-        let r = NSRect(x: 7, y: 7, width: bounds.width - 14, height: bounds.height - 14 - 34)
-        let path = NSBezierPath(rect: r)
-        let dash: [CGFloat] = [8, 6]
-        path.setLineDash(dash, count: 2, phase: 0)
-        NSColor(srgbRed: 0.13, green: 0.59, blue: 0.95, alpha: 1).setStroke()
-        path.lineWidth = 2
-        path.stroke()
     }
 }

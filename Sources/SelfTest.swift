@@ -43,7 +43,23 @@ enum SelfTest {
         testScrollStitch(outDir: outDir)
         testWhitePageMatching(outDir: outDir)
         testReanchor()
+        testDimLayer(captured: captured, sel: sel, outDir: outDir)
         if CommandLine.arguments.contains("--selftest-live") { testLiveSession() }
+    }
+
+    /// 滚动会话全屏暗色层渲染自检（快照 + 挖洞 + 边框 + 提示条）
+    private static func testDimLayer(captured: NSImage, sel: CGRect, outDir: URL) {
+        let view = ScrollBorderView(frame: NSRect(origin: .zero, size: captured.size),
+                                    region: sel, snapshot: captured)
+        view.progress = 1260
+        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+            if let data = rep.representation(using: .png, properties: [:]) {
+                let url = outDir.appendingPathComponent("dimlayer.png")
+                try? data.write(to: url)
+                print("dimlayer -> \(url.path)")
+            }
+        }
     }
 
     /// 真机冒烟（--selftest-live）：真定时器 + 真 SCK 抓帧 + 真会话。

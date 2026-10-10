@@ -239,7 +239,7 @@ extension AppDelegate: ShotViewDelegate {
     func shotViewDidRequestScroll(_ view: ShotView, selection: CGRect) {
         guard let screen = view.window?.screen else { return }
         closeOverlays()
-        let session = ScrollCaptureSession(screen: screen, regionPts: selection) { [weak self] img in
+        let session = ScrollCaptureSession(screen: screen, regionPts: selection, snapshot: view.captured) { [weak self] img in
             guard let self = self else { return }
             self.scrollSession = nil
             guard let img = img else { return }   // 取消
