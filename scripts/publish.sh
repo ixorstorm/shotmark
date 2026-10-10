@@ -5,5 +5,6 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"   # 工作区根
 BRANCH=shotmark-public
 git subtree split --prefix=work/shotmark -b "$BRANCH"
-git push https://github.com/ixorstorm/shotmark.git "$BRANCH:main"
+# 绕过全局 gitconfig 里的 ghfast.top 镜像改写（它没有我们的凭证）；osxkeychain 在系统级配置，不受影响
+GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git push https://github.com/ixorstorm/shotmark.git "$BRANCH:main"
 echo "✔ 已推送到 GitHub main"

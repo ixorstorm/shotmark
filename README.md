@@ -1,5 +1,7 @@
 # ShotMark — macOS 截图标注工具（对标飞书截图）
 
+开源镜像：https://github.com/ixorstorm/shotmark （MIT，v1.0；唯一真实源仍在工作区，`scripts/publish.sh` 一键发布）
+
 > A native macOS screenshot + annotation tool in pure Swift/AppKit — global hotkey, arrows/rects/mosaic/text, **scrolling capture with live stitch preview**, copy-to-clipboard. Zero dependencies, builds with `swiftc` alone (no Xcode needed).
 
 > **类型: 研究（工具类）** | 状态: active | 定位: 截图 + 标注一步完成，回车即进剪贴板
