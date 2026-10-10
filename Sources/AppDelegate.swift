@@ -43,12 +43,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         h.seekToEndOfFile(); h.write(("[overlay-test] \(s)\n").data(using: .utf8)!); try? h.close()
                     } else { try? ("[overlay-test] \(s)\n".data(using: .utf8)!).write(to: logURL) }
                 }
-                if let ov = self?.overlays.first, let view = ov.contentView as? ShotView {
-                    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-overlay-test.png")
+                guard let ovs = self?.overlays, !ovs.isEmpty else { log("NO OVERLAY"); NSApp.terminate(nil); return }
+                for (i, ov) in ovs.enumerated() {
+                    guard let view = ov.contentView as? ShotView else { continue }
+                    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-overlay-\(i).png")
                     Render.writePNG(view.captured, to: url)
-                    log("saved -> \(url.path) size=\(view.captured.size)")
-                } else {
-                    log("NO OVERLAY")
+                    let rep = view.captured.representations.first
+                    log("overlay[\(i)] frame=\(ov.frame) img=\(rep?.pixelsWide ?? 0)x\(rep?.pixelsHigh ?? 0) -> \(url.lastPathComponent)")
                 }
                 NSApp.terminate(nil)
             }
@@ -86,50 +87,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   "在 系统设置 → 隐私与安全性 → 屏幕录制与系统录音 中勾选 ShotMark，然后重新打开 ShotMark 再按 ⌃⇧A。")
             return
         }
+        // 目标屏 = 鼠标所在屏（飞书/CleanShot 同款口径；NSEvent.mouseLocation 后台也可读）。
+        // 参照：https://stackoverflow.com/questions/49624486/49624487
+        // 单屏单抓单覆盖层——多屏双抓被 SCK 并发换结果坑过（外屏拿回内屏像素），不再并行
         let screens = NSScreen.screens
+        let mouseLoc = NSEvent.mouseLocation
+        let target = screens.first { NSMouseInRect(mouseLoc, $0.frame, false) } ?? NSScreen.main ?? screens[0]
+        fputs("[ShotMark] 目标屏: 鼠标(\(Int(mouseLoc.x)),\(Int(mouseLoc.y))) -> \(target.frame)\n", stderr)
         Task { @MainActor in
-            var ok = false
-            var tccDenied = false
-            var firstError = ""
-            // 双屏并行抓（串行时清单一拉两遍 + 逐屏等待，~210ms；并行后 ≈ 单屏耗时）。
-            // ⚠️ 屏→显示器映射必须在主线程先解析好：NSScreen.deviceDescription 跨线程读不可靠
-            //（实测事故：并行任务里读它导致外屏装上了内屏的图——「按热键就只剩背景」）
-            var results: [Int: CGImage] = [:]
-            let jobs: [(Int, CGDirectDisplayID)] = screens.enumerated().compactMap { (i, screen) in
-                guard let did = Capture.displayID(for: screen) else { return nil }
-                fputs("[ShotMark] 映射: screen[\(i)] frame=\(screen.frame.size) id=\(did)\n", stderr)
-                return (i, did)
+            guard let did = Capture.displayID(for: target) else {
+                alert("截图失败", "未能解析目标屏幕。")
+                return
             }
-            await withTaskGroup(of: (Int, CGImage?, NSError?).self) { group in
-                for (i, did) in jobs {
-                    group.addTask {
-                        do { return (i, try await Capture.grab(displayID: did), nil) }
-                        catch { return (i, nil, error as NSError) }
-                    }
-                }
-                for await (i, cg, err) in group {
-                    if let cg = cg { results[i] = cg }
-                    if let err = err {
-                        fputs("[ShotMark] 捕获失败: \(err.domain) \(err.code) \(err.localizedDescription)\n", stderr)
-                        if err.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", err.code == -3801 { tccDenied = true }
-                        if firstError.isEmpty { firstError = "\(err.code) \(err.localizedDescription)" }
-                    }
-                }
-            }
-            for (i, screen) in screens.enumerated() {
-                if let cg = results[i] {
-                    fputs("[ShotMark] 覆盖层: screen[\(i)] \(screen.frame.size) <- 图 \(cg.width)x\(cg.height)\n", stderr)
-                    presentOverlay(screen: screen, image: NSImage(cgImage: cg, size: screen.frame.size))
-                    ok = true
-                }
-            }
-            if ok {
+            do {
+                let cg = try await Capture.grab(displayID: did)
+                fputs("[ShotMark] 覆盖层: \(target.frame.size) <- 图 \(cg.width)x\(cg.height)\n", stderr)
+                presentOverlay(screen: target, image: NSImage(cgImage: cg, size: target.frame.size))
                 NSApp.activate(ignoringOtherApps: true)
-            } else if tccDenied {
-                alert("屏幕录制权限未生效",
-                      "系统已记录授权，但当前进程还没生效。请点菜单栏取景器图标 →「退出 ShotMark」，再重新打开，然后按 ⌃⇧A。")
-            } else {
-                alert("截图失败", "未能获得屏幕内容（\(firstError)）。请检查屏幕录制权限后重试。")
+            } catch {
+                let nserr = error as NSError
+                fputs("[ShotMark] 捕获失败: \(nserr.domain) \(nserr.code) \(nserr.localizedDescription)\n", stderr)
+                if nserr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", nserr.code == -3801 {
+                    alert("屏幕录制权限未生效",
+                          "系统已记录授权，但当前进程还没生效。请点菜单栏取景器图标 →「退出 ShotMark」，再重新打开，然后按 ⌃⇧A。")
+                } else {
+                    alert("截图失败", "未能获得屏幕内容（\(nserr.code) \(nserr.localizedDescription)）。请检查屏幕录制权限后重试。")
+                }
             }
         }
     }
