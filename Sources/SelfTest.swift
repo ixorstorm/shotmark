@@ -30,6 +30,8 @@ enum SelfTest {
         view.selection = sel
         view.annotations = anns
         view.tool = .ellipse
+        // 选中态自检：第一个标注（椭圆）显示虚线框 + 四角手柄
+        view.selectedAnn = 0
         // 悬停 tip 自检：在椭圆按钮上方画「椭圆」小药丸
         view.hoverTipText = "椭圆"
         view.hoverBtnRect = CGRect(x: sel.midX, y: sel.minY - 44, width: 30, height: 28)
@@ -49,6 +51,7 @@ enum SelfTest {
         testReanchor()
         testDimLayer(captured: captured, sel: sel, outDir: outDir)
         testPasteboardTypes()
+        testAnnotationTransforms()
         if CommandLine.arguments.contains("--selftest-live") { testLiveSession() }
     }
 
@@ -68,6 +71,31 @@ enum SelfTest {
         let hasPNG = types.contains(.png)
         let hasTIFF = types.contains(.tiff)
         print("pasteboard: png=\(hasPNG) tiff=\(hasTIFF) -> \(hasPNG && hasTIFF ? "PASS" : "FAIL")")
+    }
+
+    /// 标注移动/缩放自检：translated + resized（文字按比例、形状重设、箭头动端点）
+    private static func testAnnotationTransforms() {
+        var ok = true
+        // 矩形移动
+        var rc = Annotation(tool: .rect, color: .red, width: 3)
+        rc.p1 = CGPoint(x: 10, y: 10); rc.p2 = CGPoint(x: 110, y: 60)
+        let moved = rc.translated(by: CGPoint(x: 5, y: -5))
+        ok = ok && moved.p1 == CGPoint(x: 15, y: 5) && moved.p2 == CGPoint(x: 115, y: 55)
+        // 矩形拖右上角（handle 2）：锚左下(10,10)，拖到 (160, 80)
+        let resized = rc.resized(handle: 2, from: rc.bounds, to: CGPoint(x: 160, y: 80))
+        ok = ok && resized.bounds.width == 150 && resized.bounds.height == 70
+        // 文字拖角缩放字号
+        var tx = Annotation(tool: .text, color: .red, width: 3)
+        tx.p1 = CGPoint(x: 0, y: 0); tx.text = "测试"
+        let fsBefore = tx.fontSize
+        let scaled = tx.resized(handle: 2, from: tx.bounds, to: CGPoint(x: tx.bounds.width * 2, y: 0))
+        ok = ok && abs(scaled.fontSize - fsBefore * 2) < 0.5
+        // 箭头拖 p2 侧手柄
+        var ar = Annotation(tool: .arrow, color: .red, width: 3)
+        ar.p1 = CGPoint(x: 0, y: 0); ar.p2 = CGPoint(x: 100, y: 100)
+        let arMoved = ar.resized(handle: 2, from: ar.bounds, to: CGPoint(x: 200, y: 200))
+        ok = ok && arMoved.p2 == CGPoint(x: 200, y: 200) && arMoved.p1 == CGPoint(x: 0, y: 0)
+        print("transforms: \(ok ? "PASS" : "FAIL")")
     }
 
     /// 滚动会话全屏暗色层渲染自检（快照 + 挖洞 + 边框 + 提示条）

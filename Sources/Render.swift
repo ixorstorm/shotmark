@@ -34,7 +34,7 @@ enum Render {
 
         case .text:
             guard !a.text.isEmpty else { return }
-            let fontSize: CGFloat = 14 + a.width * 2
+            let fontSize = a.fontSize   // 含拖角缩放（scale）
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
                 .foregroundColor: a.color,

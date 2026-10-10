@@ -14,6 +14,7 @@ struct Annotation {
     var p1: CGPoint         // 形状起点 / text 锚点
     var p2: CGPoint         // 形状终点
     var text: String
+    var scale: CGFloat      // text 字号缩放（拖角调）
 
     init(tool: Tool, color: NSColor, width: CGFloat) {
         self.tool = tool
@@ -23,6 +24,73 @@ struct Annotation {
         self.p1 = .zero
         self.p2 = .zero
         self.text = ""
+        self.scale = 1
+    }
+}
+
+extension Annotation {
+    /// 文字字号（渲染公式与 Render.draw 保持一致）
+    var fontSize: CGFloat { (14 + width * 2) * scale }
+
+    /// 包围盒（命中测试/虚线框/手柄用）
+    var bounds: CGRect {
+        switch tool {
+        case .text:
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
+            ]
+            let ts = NSString(string: text).size(withAttributes: attrs)
+            return CGRect(x: p1.x, y: p1.y, width: ts.width, height: ts.height)
+        case .pen:
+            guard let first = points.first else { return .zero }
+            var minX = first.x, minY = first.y, maxX = first.x, maxY = first.y
+            for pt in points {
+                minX = min(minX, pt.x); minY = min(minY, pt.y)
+                maxX = max(maxX, pt.x); maxY = max(maxY, pt.y)
+            }
+            return CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY))
+        case .arrow, .rect, .ellipse, .mosaic:
+            return CGRect(p1: p1, p2: p2)
+        }
+    }
+
+    func translated(by d: CGPoint) -> Annotation {
+        var a = self
+        a.p1 = CGPoint(x: p1.x + d.x, y: p1.y + d.y)
+        a.p2 = CGPoint(x: p2.x + d.x, y: p2.y + d.y)
+        a.points = points.map { CGPoint(x: $0.x + d.x, y: $0.y + d.y) }
+        return a
+    }
+
+    /// 拖角缩放。handle: 0=左下 1=右下 2=右上 3=左上（y-up）；orig = 原始包围盒
+    func resized(handle: Int, from orig: CGRect, to p: CGPoint) -> Annotation {
+        var a = self
+        let anchor = CGPoint(x: (handle == 0 || handle == 3) ? orig.maxX : orig.minX,
+                             y: (handle == 0 || handle == 1) ? orig.maxY : orig.minY)
+        switch tool {
+        case .text:
+            // 文字按宽度比例缩放字号（飞书同款手感）
+            let ow = max(orig.width, 1)
+            let nw = abs(p.x - anchor.x)
+            a.scale = min(6, max(0.3, scale * nw / ow))
+        case .arrow:
+            // 拖动哪侧手柄就动哪个端点
+            if handle == 0 || handle == 3 { a.p1 = p } else { a.p2 = p }
+        default:
+            let nr = CGRect(p1: anchor, p2: p)
+            let sx = nr.width / max(orig.width, 1)
+            let sy = nr.height / max(orig.height, 1)
+            if tool == .pen {
+                a.points = points.map { pt in
+                    CGPoint(x: nr.minX + (pt.x - orig.minX) * sx,
+                            y: nr.minY + (pt.y - orig.minY) * sy)
+                }
+            } else {
+                a.p1 = nr.origin
+                a.p2 = CGPoint(x: nr.maxX, y: nr.maxY)
+            }
+        }
+        return a
     }
 }
 

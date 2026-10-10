@@ -32,8 +32,12 @@ final class ShotView: NSView {
         case moving(CGPoint)              // offset = 点击点 - 选区 origin
         case resizing(Int, CGRect)        // handle 序号 + 原始 rect
         case drawing                      // 正在画标注
+        case movingAnn(CGPoint, Annotation)         // 标注移动：起点 + 原始标注
+        case resizingAnn(Int, CGRect, Annotation)   // 标注缩放：手柄 + 原始包围盒 + 原始标注
     }
     private var drag: Drag = .none
+    /// 当前选中的标注下标（虚线框 + 手柄，飞书同款编辑态）
+    var selectedAnn: Int?
 
     private var textField: NSTextField?
     private var textAnchor: CGPoint = .zero
@@ -82,6 +86,9 @@ final class ShotView: NSView {
         if let p = pending { Render.draw(annotation: p, mosaicSource: captured) }
         NSGraphicsContext.restoreGraphicsState()
 
+        // 选中标注的虚线框 + 手柄
+        drawSelectedFrame()
+
         // 选区边框 + 尺寸标签 + 手柄 + 工具栏
         NSColor(srgbRed: 0.13, green: 0.59, blue: 0.95, alpha: 1).setStroke()
         let border = NSBezierPath(rect: sel)
@@ -118,6 +125,57 @@ final class ShotView: NSView {
         NSColor.black.withAlphaComponent(0.7).setFill()
         NSBezierPath(roundedRect: bg, xRadius: 4, yRadius: 4).fill()
         NSString(string: text).draw(at: CGPoint(x: bg.minX + pad, y: bg.minY + pad - 1), withAttributes: attrs)
+    }
+
+    // MARK: - 标注命中与编辑手柄
+
+    /// 命中最上层标注（数组尾部优先）
+    private func hitAnnotation(_ p: CGPoint) -> Int? {
+        for i in annotations.indices.reversed() {
+            let a = annotations[i]
+            if a.tool == .arrow {
+                if pointLineDistance(p, a.p1, a.p2) < 8 { return i }
+            } else if a.bounds.insetBy(dx: -4, dy: -4).contains(p) {
+                return i
+            }
+        }
+        return nil
+    }
+
+    private func pointLineDistance(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let len2 = dx * dx + dy * dy
+        if len2 < 0.001 { return hypot(p.x - a.x, p.y - a.y) }
+        let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2))
+        return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
+    }
+
+    /// 标注包围盒四角手柄：0=左下 1=右下 2=右上 3=左上（y-up）
+    private func annHandleRects(_ r: CGRect) -> [CGRect] {
+        let s: CGFloat = 7, h = s / 2
+        let pts = [CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY),
+                   CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)]
+        return pts.map { CGRect(x: $0.x - h, y: $0.y - h, width: s, height: s) }
+    }
+
+    /// 选中标注的虚线框 + 四角手柄
+    private func drawSelectedFrame() {
+        guard let idx = selectedAnn, idx < annotations.count else { return }
+        let r = annotations[idx].bounds.insetBy(dx: -3, dy: -3)
+        let path = NSBezierPath(rect: r)
+        let dash: [CGFloat] = [5, 4]
+        path.setLineDash(dash, count: 2, phase: 0)
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        for hr in annHandleRects(annotations[idx].bounds) {
+            NSColor.white.setFill()
+            NSBezierPath(rect: hr).fill()
+            NSColor(srgbRed: 0.13, green: 0.59, blue: 0.95, alpha: 1).setStroke()
+            let bp = NSBezierPath(rect: hr)
+            bp.lineWidth = 1
+            bp.stroke()
+        }
     }
 
     // MARK: - 手柄
@@ -279,6 +337,22 @@ final class ShotView: NSView {
                 return
             }
             if sel.contains(p) {
+                // ① 已选中标注的手柄 → 缩放
+                if let idx = selectedAnn, idx < annotations.count {
+                    let r = annotations[idx].bounds
+                    if let h = annHandleRects(r).firstIndex(where: { $0.insetBy(dx: -3, dy: -3).contains(p) }) {
+                        drag = .resizingAnn(h, r, annotations[idx])
+                        return
+                    }
+                }
+                // ② 命中已有标注 → 选中并移动（任何工具状态下都优先；画圈请从空白处起笔）
+                if let idx = hitAnnotation(p) {
+                    selectedAnn = idx
+                    drag = .movingAnn(p, annotations[idx])
+                    needsDisplay = true
+                    return
+                }
+                selectedAnn = nil
                 if tool == .text { startText(at: p); return }
                 if let t = tool {
                     var a = Annotation(tool: t, color: color, width: lineWidth)
@@ -316,6 +390,13 @@ final class ShotView: NSView {
             selection = resizeRect(handle: h, orig: orig, to: p)
         case .drawing:
             if pending?.tool == .pen { pending?.points.append(p) } else { pending?.p2 = p }
+        case .movingAnn(let start, let orig):
+            guard let idx = selectedAnn, idx < annotations.count else { break }
+            let d = CGPoint(x: p.x - start.x, y: p.y - start.y)
+            annotations[idx] = orig.translated(by: d)
+        case .resizingAnn(let h, let origRect, let orig):
+            guard let idx = selectedAnn, idx < annotations.count else { break }
+            annotations[idx] = orig.resized(handle: h, from: origRect, to: p)
         case .none:
             break
         }
@@ -332,7 +413,10 @@ final class ShotView: NSView {
                     if pd.points.count > 1 { annotations.append(pd) }
                 } else {
                     let r = CGRect(p1: pd.p1, p2: pd.p2)
-                    if r.width >= 3 || r.height >= 3 { annotations.append(pd) }
+                    if r.width >= 3 || r.height >= 3 {
+                        annotations.append(pd)
+                        selectedAnn = annotations.count - 1   // 画完即选中，立刻可拖
+                    }
                 }
             }
             pending = nil
@@ -360,6 +444,7 @@ final class ShotView: NSView {
             widthIndex = (widthIndex + 1) % ShotView.widths.count
         case .undo:
             if !annotations.isEmpty { annotations.removeLast() }
+            selectedAnn = nil
         case .scroll:
             guard let sel = selection else { return }
             delegate?.shotViewDidRequestScroll(self, selection: sel)
@@ -395,12 +480,19 @@ final class ShotView: NSView {
         if textField != nil { super.keyDown(with: event); return }
         let cmd = event.modifierFlags.contains(.command)
         switch event.keyCode {
-        case 53:  // Esc
-            delegate?.shotView(self, didFinish: nil, action: nil)
+        case 53:  // Esc：有选中标注先取消选中，否则取消截图
+            if selectedAnn != nil {
+                selectedAnn = nil
+                needsDisplay = true
+            } else {
+                delegate?.shotView(self, didFinish: nil, action: nil)
+            }
         case 36, 49:  // Return / Space = 复制
             finish(.copy)
         case 6 where cmd:  // ⌘Z
-            if !annotations.isEmpty { annotations.removeLast(); needsDisplay = true }
+            if !annotations.isEmpty { annotations.removeLast() }
+            selectedAnn = nil
+            needsDisplay = true
         case 8 where cmd:  // ⌘C
             finish(.copy)
         case 1 where cmd:  // ⌘S
@@ -440,6 +532,7 @@ final class ShotView: NSView {
             a.p1 = textAnchor
             a.text = s
             annotations.append(a)
+            selectedAnn = annotations.count - 1
         }
         NotificationCenter.default.removeObserver(self, name: NSControl.textDidEndEditingNotification, object: tf)
         tf.removeFromSuperview()
@@ -482,7 +575,11 @@ final class ShotView: NSView {
                 return
             }
             hideHoverTip()
-            if sel.contains(p) { (tool == .text ? NSCursor.iBeam : NSCursor.crosshair).set(); return }
+            if sel.contains(p) {
+                if hitAnnotation(p) != nil { NSCursor.openHand.set(); return }
+                (tool == .text ? NSCursor.iBeam : NSCursor.crosshair).set()
+                return
+            }
         } else {
             hideHoverTip()
         }
