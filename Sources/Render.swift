@@ -114,9 +114,12 @@ enum Render {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = ctx
         ctx.imageInterpolation = .high
-        // 视图点坐标 → 导出像素：先平移 (-sel.origin)，再乘 scale
+        // 视图点坐标 → 导出像素：(p - sel.origin) * scale。
+        // ⚠️ NSAffineTransform 的组合语义是「先 scale 后 translate」（p' = p*s + t，实测）——
+        // 所以平移量必须预乘 scale，否则导出区域整体偏移 (sel.minX/2, sel.minY/2)pt，
+        // 选区右下被裁、左上带选区外内容（用户事故 2026-10-10：靠右下的文字/标注被裁掉）
         let tr = NSAffineTransform()
-        tr.translateX(by: -sel.minX, yBy: -sel.minY)
+        tr.translateX(by: -sel.minX * scale, yBy: -sel.minY * scale)
         tr.scale(by: scale)
         tr.concat()
         NSBezierPath(rect: NSRect(x: 0, y: 0, width: sel.width * scale, height: sel.height * scale)).addClip()

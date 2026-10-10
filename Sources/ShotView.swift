@@ -39,7 +39,7 @@ final class ShotView: NSView {
     /// 当前选中的标注下标（虚线框 + 手柄，飞书同款编辑态）
     var selectedAnn: Int?
 
-    private var textField: NSTextField?
+    var textField: NSTextField?   // internal：自检可达
     private var textAnchor: CGPoint = .zero
 
     private var trackingAreaRef: NSTrackingArea?
@@ -129,17 +129,47 @@ final class ShotView: NSView {
 
     // MARK: - 标注命中与编辑手柄
 
-    /// 命中最上层标注（数组尾部优先）
+    enum AnnTapResult { case resize(Int), move(Int), select(Int), none }
+
+    /// 点按判定（internal，自检直驱）：
+    /// ① 选中标注的手柄 → 缩放；② 选中标注的内部（含空腔）→ 拖动；
+    /// ③ 其他标注（空心形状只有描边沿线）→ 选中移动；④ 都没有 → 交给工具/选区
+    func resolveAnnotationTap(at p: CGPoint) -> AnnTapResult {
+        if let idx = selectedAnn, idx < annotations.count {
+            let r = annotations[idx].bounds
+            if let h = annHandleRects(r).firstIndex(where: { $0.insetBy(dx: -3, dy: -3).contains(p) }) {
+                return .resize(h)
+            }
+            if r.insetBy(dx: -4, dy: -4).contains(p) { return .move(idx) }
+        }
+        if let idx = hitAnnotation(p) { return .select(idx) }
+        return .none
+    }
+
+    /// 命中最上层标注（数组尾部优先）。
+    /// 空心形状（矩形/椭圆/马赛克）只有描边沿线命中——内部空腔不拦：
+    /// 否则「画个圈再在里面写字」会把圈选中而不是开文本框（实测事故：圈内打字文字根本没创建）。
     private func hitAnnotation(_ p: CGPoint) -> Int? {
         for i in annotations.indices.reversed() {
             let a = annotations[i]
-            if a.tool == .arrow {
+            switch a.tool {
+            case .text, .pen:
+                if a.bounds.insetBy(dx: -4, dy: -4).contains(p) { return i }
+            case .arrow:
                 if pointLineDistance(p, a.p1, a.p2) < 8 { return i }
-            } else if a.bounds.insetBy(dx: -4, dy: -4).contains(p) {
-                return i
+            case .rect, .ellipse, .mosaic:
+                if strokeHit(a, p) { return i }
             }
         }
         return nil
+    }
+
+    /// 描边沿线命中：包围盒外沿 tol 以内且不在内腔里
+    private func strokeHit(_ a: Annotation, _ p: CGPoint) -> Bool {
+        let r = a.bounds
+        let tol: CGFloat = 6
+        guard r.insetBy(dx: -tol, dy: -tol).contains(p) else { return false }
+        return !r.insetBy(dx: tol, dy: tol).contains(p)
     }
 
     private func pointLineDistance(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
@@ -337,20 +367,21 @@ final class ShotView: NSView {
                 return
             }
             if sel.contains(p) {
-                // ① 已选中标注的手柄 → 缩放
-                if let idx = selectedAnn, idx < annotations.count {
-                    let r = annotations[idx].bounds
-                    if let h = annHandleRects(r).firstIndex(where: { $0.insetBy(dx: -3, dy: -3).contains(p) }) {
-                        drag = .resizingAnn(h, r, annotations[idx])
-                        return
-                    }
-                }
-                // ② 命中已有标注 → 选中并移动（任何工具状态下都优先；画圈请从空白处起笔）
-                if let idx = hitAnnotation(p) {
+                // 标注命中判定（内部/描边/手柄的顺序逻辑抽在 resolveAnnotationTap，自检可直驱）
+                switch resolveAnnotationTap(at: p) {
+                case .resize(let h):
+                    if let idx = selectedAnn { drag = .resizingAnn(h, annotations[idx].bounds, annotations[idx]) }
+                    return
+                case .move(let idx):
+                    drag = .movingAnn(p, annotations[idx])
+                    return
+                case .select(let idx):
                     selectedAnn = idx
                     drag = .movingAnn(p, annotations[idx])
                     needsDisplay = true
                     return
+                case .none:
+                    break
                 }
                 selectedAnn = nil
                 if tool == .text { startText(at: p); return }
@@ -504,7 +535,7 @@ final class ShotView: NSView {
 
     // MARK: - 文字标注
 
-    private func startText(at p: CGPoint) {
+    func startText(at p: CGPoint) {   // internal：自检可达
         let tf = NSTextField(frame: NSRect(x: p.x, y: p.y - 13, width: 280, height: 28))
         tf.font = NSFont.systemFont(ofSize: 14 + lineWidth * 2, weight: .medium)
         tf.textColor = color
@@ -522,7 +553,7 @@ final class ShotView: NSView {
         window?.makeFirstResponder(tf)
     }
 
-    private func commitText() { commitTextAction(nil) }
+    func commitText() { commitTextAction(nil) }   // internal：自检可达
 
     @objc private func commitTextAction(_ sender: Any?) {
         guard let tf = textField else { return }

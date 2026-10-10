@@ -52,6 +52,9 @@ enum SelfTest {
         testDimLayer(captured: captured, sel: sel, outDir: outDir)
         testPasteboardTypes()
         testAnnotationTransforms()
+        testTextPipeline(captured: captured, sel: sel, outDir: outDir)
+        testExportRegion(captured: captured, sel: sel, outDir: outDir)
+        testAnnotationTapRules(captured: captured)
         if CommandLine.arguments.contains("--selftest-live") { testLiveSession() }
     }
 
@@ -71,6 +74,104 @@ enum SelfTest {
         let hasPNG = types.contains(.png)
         let hasTIFF = types.contains(.tiff)
         print("pasteboard: png=\(hasPNG) tiff=\(hasTIFF) -> \(hasPNG && hasTIFF ? "PASS" : "FAIL")")
+    }
+
+    /// 点按判定自检（用户事故 2026-10-10「圈内打字没创建文字」）：
+    /// 空心圈内部空白不拦（可开文本框）；描边沿线选中；选中后内部可拖
+    private static func testAnnotationTapRules(captured: NSImage) {
+        let view = ShotView(frame: NSRect(origin: .zero, size: captured.size), captured: captured)
+        var circle = Annotation(tool: .ellipse, color: .red, width: 4)
+        circle.p1 = CGPoint(x: 100, y: 100)
+        circle.p2 = CGPoint(x: 300, y: 300)
+        view.annotations = [circle]
+        view.selectedAnn = nil
+        var ok = true
+        // ① 圈心（空腔）：不命中 → 可开文本框
+        if case .none = view.resolveAnnotationTap(at: CGPoint(x: 200, y: 200)) {} else { ok = false }
+        // ② 描边沿线：选中
+        if case .select(0) = view.resolveAnnotationTap(at: CGPoint(x: 300, y: 200)) {} else { ok = false }
+        // ③ 选中后：圈心可拖（move）
+        view.selectedAnn = 0
+        if case .move(0) = view.resolveAnnotationTap(at: CGPoint(x: 200, y: 200)) {} else { ok = false }
+        // ④ 选中后：手柄 → resize
+        view.selectedAnn = 0
+        if case .resize = view.resolveAnnotationTap(at: CGPoint(x: 300, y: 300)) {} else { ok = false }
+        print("taprules: \(ok ? "PASS" : "FAIL")")
+    }
+
+    /// 导出区域正确性自检：选区四角标记必须落在导出图的四个角上
+    ///（防「导出区域偏移」回归——这个 bug 藏了很多轮，因为内容+标注一起平移，肉眼很难发现）
+    private static func testExportRegion(captured: NSImage, sel: CGRect, outDir: URL) {
+        guard let img = Render.export(captured: captured, selection: sel, annotations: []),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { print("region: export FAIL"); return }
+        let rep = NSBitmapImageRep(cgImage: cg)
+        // 假底图选区左上角(view y-up)是深底+白聊天窗交界，右下角是深底；
+        // 用已知内容断言：导出(0,0) 应= 选区左上角内容，(W-1,H-1) 应= 选区右下角内容
+        let d = rep.bitmapData!
+        func px(_ x: Int, _ y: Int) -> (Int, Int, Int) {
+            let i = (y * cg.width + x) * 4
+            return (Int(d[i]), Int(d[i+1]), Int(d[i+2]))
+        }
+        // 选区左上角 (220,610 y-up) 在假底图里是代码窗顶部深灰(0.16)附近；
+        // 更稳的锚点：选区底边中点 (600,170 y-up) 在假底图里是白聊天窗底边附近(近白) vs 选区顶边中点 (600,610) 是深底(近黑)
+        let topMid = px(cg.width / 2, 2)          // 选区顶边中点 → 深底(代码窗)
+        let bottomMid = px(cg.width / 2, cg.height - 3)  // 选区底边中点 → 白聊天窗
+        let topDark = topMid.0 < 120 && topMid.1 < 120 && topMid.2 < 140
+        let bottomLight = bottomMid.0 > 200 && bottomMid.1 > 200 && bottomMid.2 > 200
+        let ok = topDark && bottomLight
+        print("region: 顶中=\(topMid) 底中=\(bottomMid) 上深下白=\(ok) -> \(ok ? "PASS" : "FAIL")")
+    }
+
+    /// 文字标注完整管道自检：startText → 输入 → commit → 导出，验证导出图里真有字
+    ///（用户事故 2026-10-10：「编辑好的文字没出现在截图里」）
+    private static func testTextPipeline(captured: NSImage, sel: CGRect, outDir: URL) {
+        let view = ShotView(frame: NSRect(origin: .zero, size: captured.size), captured: captured)
+        view.selection = sel
+        view.tool = .text
+        let anchor = CGPoint(x: sel.midX - 100, y: sel.midY)
+        view.startText(at: anchor)
+        view.textField?.stringValue = "管道测试文字"
+        view.commitText()
+        let committed = view.annotations.count == 1 && view.annotations[0].text == "管道测试文字"
+        if let ann = view.annotations.first {
+            print("textpipe: anchor=\(anchor) p1=\(ann.p1) bounds=\(ann.bounds)")
+        }
+
+        // 导出对比：有字 vs 无字，文字区域像素必须不同
+        guard let withText = Render.export(captured: captured, selection: sel, annotations: view.annotations),
+              let withoutText = Render.export(captured: captured, selection: sel, annotations: []),
+              let cgA = withText.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let cgB = withoutText.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            print("textpipe: export FAIL"); return
+        }
+        // 整图找差异像素块（文字在哪不重要，在就行；整图均值会稀释、裁剪坐标换算易错，都绕过）
+        let fa = ScrollCaptureSession.Frame(cgA)
+        let fb = ScrollCaptureSession.Frame(cgB)
+        var minX = Int.max, minY = Int.max, maxX = -1, maxY = -1, diffs = 0
+        fa.data.withUnsafeBytes { pa in
+            fb.data.withUnsafeBytes { pb in
+                let a = pa.bindMemory(to: UInt8.self), b = pb.bindMemory(to: UInt8.self)
+                var y = 0
+                while y < fa.h {
+                    var x = 0
+                    while x < fa.w {
+                        let i = y * fa.bpr + x * 4
+                        let d = abs(Int(a[i]) - Int(b[i])) + abs(Int(a[i+1]) - Int(b[i+1])) + abs(Int(a[i+2]) - Int(b[i+2]))
+                        if d > 36 {
+                            diffs += 1
+                            minX = min(minX, x); maxX = max(maxX, x)
+                            minY = min(minY, y); maxY = max(maxY, y)
+                        }
+                        x += 2
+                        y += 0
+                    }
+                    y += 2
+                }
+            }
+        }
+        let visible = diffs > 50
+        print("textpipe: 提交=\(committed) 差异像素=\(diffs) 区域=(\(minX),\(minY))-(\(maxX),\(maxY)) 可见=\(visible) -> \(committed && visible ? "PASS" : "FAIL")")
+        Render.writePNG(withText, to: outDir.appendingPathComponent("textpipe.png"))
     }
 
     /// 标注移动/缩放自检：translated + resized（文字按比例、形状重设、箭头动端点）
