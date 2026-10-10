@@ -60,15 +60,21 @@ enum Capture {
         return content.displays.first(where: { $0.width == w && $0.height == h })
     }
 
-    /// 按 displayID 直抓（调用方在主线程解析好映射再传进来）
+    /// 按 displayID 直抓（调用方在主线程解析好映射再传进来）。
+    /// 走 5s 清单缓存（warm() 启动即预热，热键常态 0ms 命中）；
+    /// displayID 失配（显示器切换过渡期）才作废缓存拉一次新鲜的。
     static func grab(displayID: CGDirectDisplayID) async throws -> CGImage {
         let t0 = Date()
-        let content = try await freshContent()   // 热键路径不用缓存：过渡期缓存清单里的 SCDisplay 会失配
+        var content = try await content()
+        var display = content.displays.first(where: { $0.displayID == displayID })
+        if display == nil {
+            invalidateContentCache()
+            content = try await freshContent()
+            display = content.displays.first(where: { $0.displayID == displayID })
+        }
         let t1 = Date()
         fputs("[timing] ShareableContent \(String(format: "%.0f", t1.timeIntervalSince(t0)*1000))ms\n", stderr)
-        guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
-            throw CaptureError.displayNotFound
-        }
+        guard let display else { throw CaptureError.displayNotFound }
         fputs("[timing] displayID \(displayID) -> SCDisplay \(display.displayID) \(display.width)x\(display.height)\n", stderr)
         return try await captureDisplay(display)
     }

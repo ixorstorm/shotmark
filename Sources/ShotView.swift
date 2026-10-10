@@ -537,14 +537,18 @@ final class ShotView: NSView {
 
     func startText(at p: CGPoint) {   // internal：自检可达
         let fontSize = 14 + lineWidth * 2
-        let inkH = fontSize * 0.72                    // 墨迹高度近似（实测 20pt 字 ≈ 14pt）
         let fieldH = ceil(fontSize * 1.45)
-        // 基线对齐：draw(at: p) 的墨迹下沿 = p.y + 6（实测），
-        // 框内墨迹下沿 = fieldY + (fieldH - inkH)/2 → 反解 fieldY。
-        // 否则提交瞬间文字会「往上跳一节」（用户实测反馈）
-        let fieldY = p.y + 6 - (fieldH - inkH) / 2
+        // 基线对齐（实测校准，bitmap 墨迹逐像素测的）：
+        // draw(at: p) 墨迹下沿 = p.y + 4；框墨迹下沿 = fieldY + fontSize*0.45
+        // → fieldY = p.y - fontSize*0.25。偏了就会「提交瞬间文字跳位」
+        let fieldY = p.y - fontSize * 0.25
         let tf = NSTextField(frame: NSRect(x: p.x - 3, y: fieldY, width: 280, height: fieldH))
         tf.font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+        // 长文字不折行：随输入自动变宽（不换行），最宽到选区右缘
+        tf.cell?.wraps = false
+        tf.cell?.isScrollable = true
+        NotificationCenter.default.addObserver(self, selector: #selector(textDidChange(_:)),
+                                               name: NSControl.textDidChangeNotification, object: tf)
         tf.textColor = color
         tf.isBordered = false
         tf.drawsBackground = false   // 飞书同款：直接打字，无底衬
@@ -558,6 +562,16 @@ final class ShotView: NSView {
         textField = tf
         textAnchor = p
         window?.makeFirstResponder(tf)
+    }
+
+    /// 输入时自动变宽（不超选区右缘；selftest 可达性同 commitText）
+    @objc private func textDidChange(_ note: Notification) {
+        guard let tf = note.object as? NSTextField, tf == textField else { return }
+        guard let sel = selection else { return }
+        let font = tf.font ?? NSFont.systemFont(ofSize: 20)
+        let w = ceil(NSString(string: tf.stringValue).size(withAttributes: [.font: font]).width) + 12
+        tf.frame = NSRect(x: tf.frame.minX, y: tf.frame.minY,
+                          width: max(60, min(sel.maxX - tf.frame.minX - 8, w)), height: tf.frame.height)
     }
 
     func commitText() { commitTextAction(nil) }   // internal：自检可达
@@ -589,15 +603,20 @@ final class ShotView: NSView {
         trackingAreaRef = t
     }
 
-    /// 手柄悬停光标：双向箭头（macOS 对角线缩放光标是私有 selector，取不到退回十字）
+    /// 选区手柄悬停光标（8 柄序：0=左下 1=下中 2=右下 3=右中 4=右上 5=上中 6=左上 7=左中）
     private func setResizeCursor(handle i: Int) {
-        // 0=左下 1=下中 2=右下 3=右中 4=右上 5=上中 6=左上 7=左中；标注手柄 0-3 同序四角
         switch i {
         case 1, 5: NSCursor.resizeUpDown.set()
         case 3, 7: NSCursor.resizeLeftRight.set()
         case 0, 4: Self.diagonalResizeCursor(nesw: true)?.set() ?? NSCursor.crosshair.set()
         default:   Self.diagonalResizeCursor(nesw: false)?.set() ?? NSCursor.crosshair.set()
         }
+    }
+
+    /// 标注手柄悬停光标（4 角序：0=左下 1=右下 2=右上 3=左上——和选区 8 柄序不同，别混）
+    private func setAnnResizeCursor(handle i: Int) {
+        let nesw = (i == 0 || i == 2)   // 左下/右上走 NE-SW；右下/左上走 NW-SE
+        Self.diagonalResizeCursor(nesw: nesw)?.set() ?? NSCursor.crosshair.set()
     }
 
     private static func diagonalResizeCursor(nesw: Bool) -> NSCursor? {
@@ -633,10 +652,10 @@ final class ShotView: NSView {
             hideHoverTip()
             // 选区手柄 → 双箭头
             if let h = handleIndex(at: p, sel: sel) { setResizeCursor(handle: h); return }
-            // 选中标注的手柄 → 双箭头
+            // 选中标注的手柄 → 双箭头（标注手柄是 4 角序，映射和选区 8 柄序不同）
             if let idx = selectedAnn, idx < annotations.count,
                let h = annHandleRects(annotations[idx].bounds).firstIndex(where: { $0.insetBy(dx: -3, dy: -3).contains(p) }) {
-                setResizeCursor(handle: h)
+                setAnnResizeCursor(handle: h)
                 return
             }
             if sel.contains(p) {
