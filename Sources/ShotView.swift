@@ -4,7 +4,7 @@ enum FinishAction { case copy, save, pin }
 
 protocol ShotViewDelegate: AnyObject {
     /// image=nil 表示取消
-    func shotView(_ view: ShotView, didFinish image: NSImage?, action: FinishAction?)
+    func shotView(_ view: ShotView, didFinish image: NSImage?, action: FinishAction?, blank: Bool)
     /// 请求进入滚动截屏（基于当前选区）
     func shotViewDidRequestScroll(_ view: ShotView, selection: CGRect)
 }
@@ -490,7 +490,7 @@ final class ShotView: NSView {
             finish(.pin)
             return
         case .cancel:
-            delegate?.shotView(self, didFinish: nil, action: nil)
+            delegate?.shotView(self, didFinish: nil, action: nil, blank: false)
             return
         }
         needsDisplay = true
@@ -499,10 +499,39 @@ final class ShotView: NSView {
     private func finish(_ action: FinishAction) {
         guard let sel = selection,
               let img = Render.export(captured: captured, selection: sel, annotations: annotations) else {
-            delegate?.shotView(self, didFinish: nil, action: nil)
+            delegate?.shotView(self, didFinish: nil, action: nil, blank: false)
             return
         }
-        delegate?.shotView(self, didFinish: img, action: action)
+        // 证据落盘（覆盖写，不攒垃圾）：白图/空图间歇问题的现场
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        Render.writePNG(captured, to: dir.appendingPathComponent("shotmark-last-captured.png"))
+        Render.writePNG(img, to: dir.appendingPathComponent("shotmark-last-export.png"))
+        // 空白检测：导出均亮度 >248 且暗像素 <5% = 白板
+        var blank = false
+        if let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            let f = ScrollCaptureSession.Frame(cg)
+            var lumSum = 0, dark = 0, n = 0
+            f.data.withUnsafeBytes { raw in
+                let px = raw.bindMemory(to: UInt8.self)
+                var y = 0
+                while y < f.h {
+                    var x = 0
+                    while x < f.w {
+                        let i = y * f.bpr + x * 4
+                        let lum = (Int(px[i]) + Int(px[i+1]) + Int(px[i+2])) / 3
+                        lumSum += lum
+                        if lum < 200 { dark += 1 }
+                        n += 1
+                        x += 8
+                    }
+                    y += 8
+                }
+            }
+            let meanLum = n > 0 ? lumSum / n : 0
+            blank = n > 0 && meanLum > 248 && dark * 20 < n
+            fputs("[ShotMark] export \(cg.width)x\(cg.height) meanLum=\(meanLum) dark%=\(n > 0 ? dark * 100 / n : 0) blank=\(blank)\n", stderr)
+        }
+        delegate?.shotView(self, didFinish: img, action: action, blank: blank)
     }
 
     // MARK: - 键盘
@@ -516,7 +545,7 @@ final class ShotView: NSView {
                 selectedAnn = nil
                 needsDisplay = true
             } else {
-                delegate?.shotView(self, didFinish: nil, action: nil)
+                delegate?.shotView(self, didFinish: nil, action: nil, blank: false)
             }
         case 36, 49:  // Return / Space = 复制
             finish(.copy)

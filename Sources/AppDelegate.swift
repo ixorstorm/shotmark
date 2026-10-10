@@ -233,7 +233,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 extension AppDelegate: ShotViewDelegate {
-    func shotView(_ view: ShotView, didFinish image: NSImage?, action: FinishAction?) {
+    func shotView(_ view: ShotView, didFinish image: NSImage?, action: FinishAction?, blank: Bool = false) {
+        if blank {
+            // 白板导出：不静默出白图——toast 提示重试，现场已落盘 $TMPDIR/shotmark-last-*.png
+            fputs("[ShotMark] ⚠️ 导出白板，action=\(String(describing: action))\n", stderr)
+            showToast("截图内容异常（空白），请重试")
+            return
+        }
         closeOverlays()
         guard let img = image, let action = action else { return }
         switch action {
