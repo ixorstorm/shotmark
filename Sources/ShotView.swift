@@ -40,6 +40,12 @@ final class ShotView: NSView {
 
     private var trackingAreaRef: NSTrackingArea?
 
+    // 悬停 tip（自绘：系统 tooltip 是独立小窗，层级比我们 shielding 级覆盖层低，会被压住看不见）
+    var hoverBtnRect: CGRect?          // internal：自检可直接驱动
+    var hoverTipText: String?
+    var hoverTipVisible = false
+    private var hoverToken = 0
+
     // MARK: - 初始化
 
     init(frame f: NSRect, captured: NSImage) {
@@ -84,6 +90,7 @@ final class ShotView: NSView {
         drawSizeLabel(sel)
         drawHandles(sel)
         drawToolbar(sel)
+        drawHoverTip()
     }
 
     private func drawHint() {
@@ -256,6 +263,7 @@ final class ShotView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeKey()
+        hideHoverTip()
         let p = event.locationInWindow
         commitText()
 
@@ -457,15 +465,57 @@ final class ShotView: NSView {
             let (strip, items) = toolbarLayout(sel)
             if strip.contains(p) {
                 NSCursor.pointingHand.set()
-                toolTip = items.first(where: { $0.1.contains(p) }).map { tooltip(for: $0.0) }
+                if let (btn, r) = items.first(where: { $0.1.contains(p) }) {
+                    if hoverBtnRect != r {
+                        hoverBtnRect = r
+                        hoverTipText = tooltip(for: btn)
+                        hoverTipVisible = false
+                        hoverToken += 1
+                        let token = hoverToken
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+                            guard let self = self, self.hoverToken == token, self.hoverBtnRect != nil else { return }
+                            self.hoverTipVisible = true
+                            self.needsDisplay = true
+                        }
+                    }
+                }
+                needsDisplay = true
                 return
             }
-            toolTip = nil
+            hideHoverTip()
             if sel.contains(p) { (tool == .text ? NSCursor.iBeam : NSCursor.crosshair).set(); return }
         } else {
-            toolTip = nil
+            hideHoverTip()
         }
         NSCursor.crosshair.set()
+    }
+
+    private func hideHoverTip() {
+        if hoverBtnRect != nil || hoverTipVisible {
+            hoverBtnRect = nil
+            hoverTipVisible = false
+            hoverToken += 1
+            needsDisplay = true
+        }
+    }
+
+    /// 悬停 tip：深色小药丸，画在按钮上方（画在覆盖层内部，不受窗口层级影响）
+    private func drawHoverTip() {
+        guard hoverTipVisible, let text = hoverTipText, let anchor = hoverBtnRect else { return }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let ts = NSString(string: text).size(withAttributes: attrs)
+        let w = ts.width + 14, h: CGFloat = 20
+        var x = anchor.midX - w / 2
+        x = min(max(4, x), bounds.width - w - 4)
+        var y = anchor.maxY + 6
+        if y + h > bounds.height - 4 { y = anchor.minY - h - 6 }   // 上方没空间就放下方
+        let pill = NSRect(x: x, y: y, width: w, height: h)
+        NSColor(white: 0.08, alpha: 0.95).setFill()
+        NSBezierPath(roundedRect: pill, xRadius: 5, yRadius: 5).fill()
+        NSString(string: text).draw(at: CGPoint(x: pill.minX + 7, y: pill.minY + 3), withAttributes: attrs)
     }
 
     private func tooltip(for btn: Btn) -> String {

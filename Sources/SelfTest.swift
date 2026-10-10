@@ -30,6 +30,10 @@ enum SelfTest {
         view.selection = sel
         view.annotations = anns
         view.tool = .ellipse
+        // 悬停 tip 自检：在椭圆按钮上方画「椭圆」小药丸
+        view.hoverTipText = "椭圆"
+        view.hoverBtnRect = CGRect(x: sel.midX, y: sel.minY - 44, width: 30, height: 28)
+        view.hoverTipVisible = true
         if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
             view.cacheDisplay(in: view.bounds, to: rep)
             if let data = rep.representation(using: .png, properties: [:]) {
