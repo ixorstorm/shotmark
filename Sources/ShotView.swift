@@ -417,8 +417,7 @@ final class ShotView: NSView {
         tf.font = NSFont.systemFont(ofSize: 14 + lineWidth * 2, weight: .medium)
         tf.textColor = color
         tf.isBordered = false
-        tf.drawsBackground = true
-        tf.backgroundColor = NSColor.black.withAlphaComponent(0.35)
+        tf.drawsBackground = false   // 飞书同款：直接打字，无底衬
         tf.focusRingType = .none
         tf.placeholderString = "输入文字，回车确认"
         tf.target = self
