@@ -141,7 +141,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func copyToPasteboard(_ img: NSImage) {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.writeObjects([img])
+        // PNG 必须显式放：writeObjects([NSImage]) 只给 TIFF，而 UTM/SPICE 剪贴板同步、
+        // Windows/Linux 端、多数虚拟机都认 public.png（macOS 原生 ⇧⌃⌘4 进剪贴板的就是 PNG）
+        if let png = Render.pngData(of: img) {
+            pb.setData(png, forType: .png)
+        }
+        if let tiff = img.tiffRepresentation {
+            pb.setData(tiff, forType: .tiff)
+        }
     }
 
     private func saveImage(_ img: NSImage, reveal: Bool = true) {

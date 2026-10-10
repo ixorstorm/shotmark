@@ -44,7 +44,26 @@ enum SelfTest {
         testWhitePageMatching(outDir: outDir)
         testReanchor()
         testDimLayer(captured: captured, sel: sel, outDir: outDir)
+        testPasteboardTypes()
         if CommandLine.arguments.contains("--selftest-live") { testLiveSession() }
+    }
+
+    /// 剪贴板类型自检：写入的图必须同时含 public.png（虚拟机/UTM 认这个）+ public.tiff
+    /// 用独立 scratch pasteboard，不碰用户的通用剪贴板
+    private static func testPasteboardTypes() {
+        let img = NSImage(size: NSSize(width: 8, height: 8))
+        img.lockFocus()
+        NSColor.red.setFill()
+        NSRect(x: 0, y: 0, width: 8, height: 8).fill()
+        img.unlockFocus()
+        let pb = NSPasteboard(name: NSPasteboard.Name("shotmark-selftest"))
+        pb.clearContents()
+        if let png = Render.pngData(of: img) { pb.setData(png, forType: .png) }
+        if let tiff = img.tiffRepresentation { pb.setData(tiff, forType: .tiff) }
+        let types = pb.types ?? []
+        let hasPNG = types.contains(.png)
+        let hasTIFF = types.contains(.tiff)
+        print("pasteboard: png=\(hasPNG) tiff=\(hasTIFF) -> \(hasPNG && hasTIFF ? "PASS" : "FAIL")")
     }
 
     /// 滚动会话全屏暗色层渲染自检（快照 + 挖洞 + 边框 + 提示条）
