@@ -99,6 +99,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 alert("截图失败", "未能解析目标屏幕。")
                 return
             }
+            // 启动台/调度中心检测：它们由 Dock 渲染在独立合成平面，SCK 抓不到
+            //（抓到的是底下桌面，用户会误以为截到了——「截出来是空的」事故 2026-10-12）。
+            // 检测口径待校准：先把现场打进日志（frontmost + Dock 全屏窗），命中就拦。
+            if let content = try? await Capture.content() {
+                let dockWins = content.windows.filter {
+                    $0.owningApplication?.bundleIdentifier == "com.apple.dock" && $0.isOnScreen
+                }
+                let front = NSWorkspace.shared.frontmostApplication
+                fputs("[ShotMark] 现场: frontmost=\(front?.bundleIdentifier ?? "?") dockOnScreen=\(dockWins.map { "\(($0.title ?? "").isEmpty ? "无题" : ($0.title ?? "")) \(Int($0.frame.width))x\(Int($0.frame.height))" })\n", stderr)
+                let dockFullscreen = dockWins.contains {
+                    ($0.title ?? "").isEmpty && $0.frame.width >= target.frame.width * 0.9 && $0.frame.height >= target.frame.height * 0.9
+                }
+                if dockFullscreen {
+                    fputs("[ShotMark] ⚠️ 检测到 Dock 全屏界面（启动台/调度中心），SCK 抓不到它，拦截\n", stderr)
+                    showToast("启动台/调度中心界面无法截取（macOS 不暴露给截图 API）")
+                    return
+                }
+            }
             do {
                 let cg = try await Capture.grab(displayID: did)
                 fputs("[ShotMark] 覆盖层: \(target.frame.size) <- 图 \(cg.width)x\(cg.height)\n", stderr)
