@@ -62,6 +62,20 @@ extension Annotation {
         return a
     }
 
+    /// 平移+缩放到像素坐标（导出用；文字只缩 scale 字段不缩 width，字号才和视图里等比）
+    func pixelMapped(scale s: CGFloat, dx: CGFloat, dy: CGFloat) -> Annotation {
+        var a = self
+        a.p1 = CGPoint(x: (p1.x + dx) * s, y: (p1.y + dy) * s)
+        a.p2 = CGPoint(x: (p2.x + dx) * s, y: (p2.y + dy) * s)
+        a.points = points.map { CGPoint(x: ($0.x + dx) * s, y: ($0.y + dy) * s) }
+        if tool == .text {
+            a.scale = scale * s       // 字号 = (14+w*2)*scale，乘 s 即等比
+        } else {
+            a.width = width * s
+        }
+        return a
+    }
+
     /// 拖角缩放。handle: 0=左下 1=右下 2=右上 3=左上（y-up）；orig = 原始包围盒
     func resized(handle: Int, from orig: CGRect, to p: CGPoint) -> Annotation {
         var a = self

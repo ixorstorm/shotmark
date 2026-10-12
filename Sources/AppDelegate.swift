@@ -112,9 +112,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ($0.title ?? "").isEmpty && $0.frame.width >= target.frame.width * 0.9 && $0.frame.height >= target.frame.height * 0.9
                 }
                 if dockFullscreen {
-                    fputs("[ShotMark] ⚠️ 检测到 Dock 全屏界面（启动台/调度中心），SCK 抓不到它，拦截\n", stderr)
-                    showToast("启动台/调度中心界面无法截取（macOS 不暴露给截图 API）")
-                    return
+                    // 只记日志不拦截（10-12 翻案：Tahoe 的「应用程序」其实抓得到，白图是导出变换的锅）
+                    fputs("[ShotMark] 注意：检测到 Dock 全屏界面（可能启动台/调度中心），照常截\n", stderr)
                 }
             }
             do {

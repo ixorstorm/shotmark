@@ -103,7 +103,17 @@ enum Render {
         let pxW = Int((sel.width * scale).rounded())
         let pxH = Int((sel.height * scale).rounded())
         guard pxW > 0, pxH > 0,
-              let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+              let cgFull = captured.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+
+        // 底图：CGImage 直接按像素裁剪。⚠️ 不用 NSAffineTransform——实测它在翻转位图上下文中
+        // 组合行为不可控（网格扫描实锤：多数选区导出透明/错位，2026-10-12 白图事故根因）
+        let cropPx = CGRect(x: (sel.minX * scale).rounded(),
+                            y: ((captured.size.height - sel.maxY) * scale).rounded(),  // 视图 y-up → 像素左上原点
+                            width: sel.width * scale, height: sel.height * scale)
+        guard let cgCrop = cgFull.cropping(to: cropPx) else { return nil }
+        let baseImg = NSImage(cgImage: cgCrop, size: NSSize(width: pxW, height: pxH))
+
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
                                          pixelsWide: pxW, pixelsHigh: pxH,
                                          bitsPerSample: 8, samplesPerPixel: 4,
                                          hasAlpha: true, isPlanar: false,
@@ -114,25 +124,17 @@ enum Render {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = ctx
         ctx.imageInterpolation = .high
-        // 视图点坐标 → 导出像素：(p - sel.origin) * scale。
-        // ⚠️ NSAffineTransform 的组合语义是「先 scale 后 translate」（p' = p*s + t，实测）——
-        // 所以平移量必须预乘 scale，否则导出区域整体偏移 (sel.minX/2, sel.minY/2)pt，
-        // 选区右下被裁、左上带选区外内容（用户事故 2026-10-10：靠右下的文字/标注被裁掉）
-        let tr = NSAffineTransform()
-        tr.translateX(by: -sel.minX * scale, yBy: -sel.minY * scale)
-        tr.scale(by: scale)
-        tr.concat()
-        NSBezierPath(rect: NSRect(x: 0, y: 0, width: sel.width * scale, height: sel.height * scale)).addClip()
-        captured.draw(in: NSRect(origin: .zero, size: captured.size))
-        for a in annotations { draw(annotation: a, mosaicSource: captured) }
+        baseImg.draw(in: NSRect(x: 0, y: 0, width: pxW, height: pxH))
+        // 标注平移+缩放到像素坐标后 1:1 绘制（同样不经上下文变换）
+        for a in annotations {
+            draw(annotation: a.pixelMapped(scale: scale, dx: -sel.minX, dy: -sel.minY), mosaicSource: baseImg)
+        }
         NSGraphicsContext.restoreGraphicsState()
 
         let img = NSImage(size: NSSize(width: sel.width, height: sel.height))
         img.addRepresentation(rep)
         return img
     }
-
-    // MARK: - PNG
 
     static func pngData(of img: NSImage) -> Data? {
         guard let tiff = img.tiffRepresentation,
