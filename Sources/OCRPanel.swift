@@ -92,7 +92,8 @@ final class OCRPanelController: NSObject {
     private func buildPanel() {
         let panel = KeyablePanel(contentRect: NSRect(x: 0, y: 0, width: panelW, height: panelH),
                                  styleMask: .borderless, backing: .buffered, defer: false)
-        panel.level = .floating
+        // 覆盖层在 CGShieldingWindowLevel（~2024）——面板要压在它上面才能与截图状态共存（飞书同款）
+        panel.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 1)
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.isReleasedWhenClosed = false   // ⚠️ 坑 #4：close() 自释放 + 属性 nil 化 = double free

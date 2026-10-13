@@ -163,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func closeOverlays() {
         for w in overlays { w.close() }
         overlays.removeAll()
+        OCRPanelController.shared.close()   // 截图状态收起，OCR 面板跟着收（二者共存、共退）
     }
 
     // MARK: - 完成动作
@@ -269,7 +270,8 @@ extension AppDelegate: ShotViewDelegate {
             showToast("截图内容异常（空白），请重试")
             return
         }
-        closeOverlays()
+        // OCR 期间保留覆盖层（飞书同款：暗色截图状态 + 文字面板同时显示，截图不准可重新框选）
+        if action != .ocr { closeOverlays() }
         guard let img = image, let action = action else { return }
         switch action {
         case .copy: copyToPasteboard(img)
