@@ -143,6 +143,7 @@ final class OCRPanelController: NSObject {
         let scroll = NSScrollView()
         scroll.documentView = tv
         scroll.frame = NSRect(x: 12, y: 54, width: panelW - 24, height: panelH - 54 - 46)
+        scroll.drawsBackground = false   // ⚠️ 默认 true 自带白底，会盖住深色 layer（白底白字事故）
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.wantsLayer = true

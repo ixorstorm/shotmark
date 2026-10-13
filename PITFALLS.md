@@ -32,7 +32,11 @@
 - 修法：NSPanel 子类覆写 `override var canBecomeKey: Bool { true }`
 - 顺带：本地事件监听 API 是 `NSEvent.addLocalMonitorForEvents(matching:handler:)`，别记成 addLocalEventMonitorForEvents
 
-### 6. 系统 tooltip 被覆盖层压住
+### 6. NSScrollView 默认白底盖住深色主题
+- `drawsBackground` 默认 true 且 backgroundColor 是白——layer 深色底会被它盖住，配上白色文字就是「白底白字」
+- 修法：`scroll.drawsBackground = false`（textView 同理）
+
+### 7. 系统 tooltip 被覆盖层压住
 - **现象**：按钮悬停不弹 tips
 - **根因**：系统 tooltip 是独立小窗，层级比 shielding 级全屏覆盖层低
 - **修法**：覆盖层内部自绘悬停药丸（0.55s 延迟浮出）
