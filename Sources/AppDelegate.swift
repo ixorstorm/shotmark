@@ -24,6 +24,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem?.button?.title = "⚠️"
         }
 
+        if CommandLine.arguments.contains("--ocr-test") {
+            // 面板冒烟：弹「识别中…」→ 1s 后填示例结果（真识别走 --selftest 的 testOCR）
+            guard let screen = NSScreen.main else { return }
+            OCRPanelController.shared.show(on: screen)
+            OCRPanelController.shared.setLoading()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                OCRPanelController.shared.setResult("面板冒烟测试：这行字应该出现在可编辑的文本框里。\n第二行。")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { NSApp.terminate(nil) }
+            return
+        }
+
         if CommandLine.arguments.contains("--toast-test") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
                 self?.showToast("滚动截屏完成：已复制到剪贴板（3160×8920px）", saveImage: NSImage(size: NSSize(width: 10, height: 10)))
@@ -264,16 +276,16 @@ extension AppDelegate: ShotViewDelegate {
         case .save: saveImage(img)
         case .pin:  pinImage(img)
         case .ocr:
+            // 飞书同款：立即弹「识别中…」面板，结果可查看/编辑，用户点「复制文本」才进剪贴板
+            let mouse = NSEvent.mouseLocation
+            let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+            if let screen = screen {
+                OCRPanelController.shared.show(on: screen)
+                OCRPanelController.shared.setLoading()
+            }
             Task { @MainActor in
-                if let text = await OCR.recognize(img) {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(text, forType: .string)
-                    let n = text.filter { !$0.isNewline }.count
-                    showToast("文字识别完成：已复制 \(n) 字")
-                } else {
-                    showToast("未识别到文字")
-                }
+                let text = await OCR.recognize(img)
+                OCRPanelController.shared.setResult(text ?? "")
             }
         }
     }

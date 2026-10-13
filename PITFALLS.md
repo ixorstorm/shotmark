@@ -27,7 +27,12 @@
 - **修法**：一切程序创建的窗口一律 `isReleasedWhenClosed = false`
 - **教训**：第一次误诊为 Carbon 热键回调里同步注销热键（也修了但不是它）——崩溃要看 .ips 原文，不要猜
 
-### 5. 系统 tooltip 被覆盖层压住
+### 5. borderless 窗默认拿不到键盘焦点
+- `canBecomeKey` 默认 false——文本框放进去选不了字、光标不闪
+- 修法：NSPanel 子类覆写 `override var canBecomeKey: Bool { true }`
+- 顺带：本地事件监听 API 是 `NSEvent.addLocalMonitorForEvents(matching:handler:)`，别记成 addLocalEventMonitorForEvents
+
+### 6. 系统 tooltip 被覆盖层压住
 - **现象**：按钮悬停不弹 tips
 - **根因**：系统 tooltip 是独立小窗，层级比 shielding 级全屏覆盖层低
 - **修法**：覆盖层内部自绘悬停药丸（0.55s 延迟浮出）
