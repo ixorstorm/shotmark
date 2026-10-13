@@ -26,7 +26,7 @@ $(BIN): $(SRC) Info.plist $(ICNS)
 	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	xcrun swiftc -swift-version 5 -O -sdk $(SDK) -target $(TARGET) \
 		-o $(BIN) $(SRC) \
-		-framework AppKit -framework Carbon -framework ScreenCaptureKit
+		-framework AppKit -framework Carbon -framework ScreenCaptureKit -framework Vision
 	@cp Info.plist $(APP)/Contents/Info.plist
 	@cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	@codesign --force --sign "ShotMark Local Signing" --identifier dev.shotmark --timestamp=none $(APP) 2>/dev/null \

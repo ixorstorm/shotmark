@@ -51,6 +51,7 @@ enum SelfTest {
         testReanchor()
         testDimLayer(captured: captured, sel: sel, outDir: outDir)
         testPasteboardTypes()
+        testOCR()
         testAnnotationTransforms()
         testTextPipeline(captured: captured, sel: sel, outDir: outDir)
         testExportRegion(captured: captured, sel: sel, outDir: outDir)
@@ -172,6 +173,28 @@ enum SelfTest {
         let visible = diffs > 50
         print("textpipe: 提交=\(committed) 差异像素=\(diffs) 区域=(\(minX),\(minY))-(\(maxX),\(maxY)) 可见=\(visible) -> \(committed && visible ? "PASS" : "FAIL")")
         Render.writePNG(withText, to: outDir.appendingPathComponent("textpipe.png"))
+    }
+
+    /// 文字识别自检：画带字的图，Vision 必须找回关键字（离线，秒级）
+    private static func testOCR() {
+        let img = NSImage(size: NSSize(width: 420, height: 120))
+        img.lockFocus()
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: 420, height: 120).fill()
+        NSString(string: "OCR测试 Hello 2026").draw(at: CGPoint(x: 40, y: 45), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 30, weight: .semibold),
+            .foregroundColor: NSColor.black,
+        ])
+        img.unlockFocus()
+        let sem = DispatchSemaphore(value: 0)
+        var result = ""
+        Task {
+            result = await OCR.recognize(img) ?? ""
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 25)
+        let hit = result.contains("2026") || result.contains("Hello")
+        print("ocr: 识别=\"\(result)\" -> \(hit ? "PASS" : "FAIL")")
     }
 
     /// 标注移动/缩放自检：translated + resized（文字按比例、形状重设、箭头动端点）

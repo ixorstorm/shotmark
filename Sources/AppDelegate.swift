@@ -263,6 +263,18 @@ extension AppDelegate: ShotViewDelegate {
         case .copy: copyToPasteboard(img)
         case .save: saveImage(img)
         case .pin:  pinImage(img)
+        case .ocr:
+            Task { @MainActor in
+                if let text = await OCR.recognize(img) {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(text, forType: .string)
+                    let n = text.filter { !$0.isNewline }.count
+                    showToast("文字识别完成：已复制 \(n) 字")
+                } else {
+                    showToast("未识别到文字")
+                }
+            }
         }
     }
 

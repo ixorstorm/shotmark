@@ -1,6 +1,6 @@
 import AppKit
 
-enum FinishAction { case copy, save, pin }
+enum FinishAction { case copy, save, pin, ocr }
 
 protocol ShotViewDelegate: AnyObject {
     /// image=nil 表示取消
@@ -252,7 +252,7 @@ final class ShotView: NSView {
 
     // MARK: - 工具栏
 
-    private enum Btn { case tool(Tool), color(Int), width, undo, scroll, pin, save, copy, cancel }
+    private enum Btn { case tool(Tool), color(Int), width, undo, scroll, ocr, pin, save, copy, cancel }
 
     private let toolOrder: [(Tool, String)] = [
         (.pen, "pencil"), (.arrow, "arrow.up.right"), (.rect, "rectangle"),
@@ -273,7 +273,7 @@ final class ShotView: NSView {
         x += 10
         push(.width, 34)
         x += 10
-        for b in [Btn.undo, .scroll, .pin, .save, .copy, .cancel] { push(b, 30) }
+        for b in [Btn.undo, .scroll, .ocr, .pin, .save, .copy, .cancel] { push(b, 30) }
         x += 10
         let stripW = x
 
@@ -328,6 +328,8 @@ final class ShotView: NSView {
                 drawIcon("arrow.uturn.left", in: r, tint: .white, alpha: annotations.isEmpty ? 0.3 : 1)
             case .scroll:
                 drawIcon("scroll", in: r, tint: .white)
+            case .ocr:
+                drawIcon("doc.text.viewfinder", in: r, tint: .white)
             case .pin:
                 drawIcon("pin.fill", in: r, tint: .white)
             case .save:
@@ -486,6 +488,9 @@ final class ShotView: NSView {
         case .save:
             finish(.save)
             return
+        case .ocr:
+            finish(.ocr)
+            return
         case .pin:
             finish(.pin)
             return
@@ -549,6 +554,8 @@ final class ShotView: NSView {
             }
         case 36, 49:  // Return / Space = 复制
             finish(.copy)
+        case 31 where cmd:  // ⌘O 文字识别
+            finish(.ocr)
         case 6 where cmd:  // ⌘Z
             if !annotations.isEmpty { annotations.removeLast() }
             selectedAnn = nil
@@ -741,6 +748,7 @@ final class ShotView: NSView {
         case .width: return "线宽（点击切换 细/中/粗）"
         case .undo: return "撤销（⌘Z）"
         case .scroll: return "滚动截图"
+        case .ocr: return "文字识别：识别选区文字并复制（⌘O）"
         case .pin: return "钉图：把截图钉在屏幕上"
         case .save: return "保存到 ~/Pictures/ShotMark（⌘S）"
         case .copy: return "完成：复制到剪贴板（⏎ / 空格 / ⌘C）"
