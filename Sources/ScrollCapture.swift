@@ -72,6 +72,8 @@ final class ScrollCaptureSession: NSObject {
     private var capturing = false
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var nilStreak = 0                  // 连续配不上且内容在变的拍数（失速预警）
+    private var stickyH = 0                    // 停靠带高度（0=未检测）：视口顶部固定 UI（tab 栏等），拼长图时只保留首帧一份
+    private var stickyStreak = 0               // 停靠候选连续成立拍数（单拍会误伤页面顶部静态前缀，需累计滚动验证）
     private var broken = false                 // 追踪丢失已收尾（截断模式）
 
     private var firstFrame: Frame?
@@ -262,6 +264,58 @@ final class ScrollCaptureSession: NSObject {
 
     private var SMDebugOn: Bool { ProcessInfo.processInfo.environment["SM_DEBUG"] == "1" }
 
+    /// 激活停靠带：只记高度。后续 applyMatch 的追加/前插都跳过帧顶停靠行，
+    /// 固定 UI 只保留在长图开头（首帧天然带一份），不再重复拼入
+    private func activateSticky(_ b: Int) {
+        stickyH = b
+        borderView?.warning = "已识别固定顶栏，长图将只保留一份"
+        let line = "[ShotMark] sticky band activated: " + String(b) + "px"
+        fputs(line + "\n", stderr)
+    }
+
+    /// 行内对比度（采样像素 max-min 亮度）
+    static func rowContrast(_ f: Frame, _ row: Int) -> Int {
+        guard row < f.h else { return 0 }
+        var mn = 255, mx = 0
+        f.data.withUnsafeBytes { buf in
+            let p = buf.bindMemory(to: UInt8.self)
+            var c = 4
+            while c < f.w {
+                let i = row * f.bpr + c * 4
+                let l = (Int(p[i]) + Int(p[i+1]) + Int(p[i+2])) / 3
+                mn = min(mn, l); mx = max(mx, l)
+                c += 12
+            }
+        }
+        return mx - mn
+    }
+
+    /// 两帧同一行序号的行是否近似相等（停靠行判据：内容移动后仍不变）
+    static func rowsNearEqual(_ a: Frame, _ aRow: Int, _ b: Frame, _ bRow: Int) -> Bool {
+        guard aRow < a.h, bRow < b.h, a.w == b.w else { return false }
+        var sum = 0.0, n = 0.0
+        a.data.withUnsafeBytes { aBuf in
+            b.data.withUnsafeBytes { bBuf in
+                let p = aBuf.bindMemory(to: UInt8.self)
+                let q = bBuf.bindMemory(to: UInt8.self)
+                let ar = aRow * a.bpr
+                let br = bRow * b.bpr
+                var c = 4
+                while c < a.w {
+                    let i = ar + c * 4, j = br + c * 4
+                    sum += Double(abs(Int(p[i]) - Int(q[j])) + abs(Int(p[i+1]) - Int(q[j+1])) + abs(Int(p[i+2]) - Int(q[j+2])))
+                    n += 3
+                    c += 8
+                }
+            }
+        }
+        // 容差 60/765：独立两次渲染的文字行 AA 抖动实测 ≈ 30（随内容密度缩放）；结构性错位（文字对空白行）≈ 200
+        if ProcessInfo.processInfo.environment["SM_DEBUG"] == "1", sum / max(n, 1) > 30 {
+            fputs("[ShotMark] rowDiff aRow=\(aRow): mean=\(String(format: "%.1f", sum / max(n, 1)))\n", stderr)
+        }
+        return n > 0 ? sum / n < 60.0 : false
+    }
+
     /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
     private func applyMatch(dy: Int, nf: Frame) -> Int {
         nilStreak = 0
@@ -269,25 +323,23 @@ final class ScrollCaptureSession: NSObject {
         let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
         var appended = 0
         if dy >= 0 {
-            // 底部追加超出水位线的部分
-            let start = capturedBottom - p
-            if start < nf.h {
-                let s = max(0, start)
-                if s < nf.h,
-                   let strip = nf.cg.cropping(to: CGRect(x: 0, y: s, width: nf.w, height: nf.h - s)) {
-                    segments.append((p + s, strip))
-                    capturedBottom = max(capturedBottom, p + nf.h)
-                    appended = nf.h - s
-                }
+            // 底部追加超出水位线的部分；跳过帧顶停靠行（固定 UI 不重复拼入）
+            let start = max(capturedBottom - p, stickyH)
+            if start < nf.h,
+               let strip = nf.cg.cropping(to: CGRect(x: 0, y: start, width: nf.w, height: nf.h - start)) {
+                segments.append((p + start, strip))
+                capturedBottom = max(capturedBottom, p + nf.h)
+                appended = nf.h - start
             }
         } else {
-            // 用户上滚：顶部前插水位线之上的新内容
-            let headRows = capturedTop - p
+            // 用户上滚：顶部前插水位线之上的新内容（帧顶 stickyH 行是固定 UI，跳过）
+            let headRows = capturedTop - p - stickyH
             if headRows > 0 {
-                let take = min(headRows, nf.h)
-                if let strip = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: take)) {
-                    segments.append((p, strip))
-                    capturedTop = min(capturedTop, p)
+                let take = min(headRows, nf.h - stickyH)
+                if take > 0,
+                   let strip = nf.cg.cropping(to: CGRect(x: 0, y: stickyH, width: nf.w, height: take)) {
+                    segments.append((p + stickyH, strip))
+                    capturedTop = min(capturedTop, p + stickyH)
                     appended = take
                 }
             }
@@ -463,7 +515,8 @@ final class ScrollCaptureSession: NSObject {
     /// 帧处理（internal 便于离线自检直接驱动）
     /// 语义（ShareX 红停模式）：小位移可靠追踪；追踪丢失 = 立即收尾出图 + 提示从断点重来。
     /// 不做任何启发式放置——均匀列表上的歧义定位会产生重复/错位（实测多轮教训）。
-    func process(newFrame nf: Frame) {
+    func process(newFrame frameIn: Frame) {
+        var nf = frameIn
         guard !tornDown else { return }
         guard firstFrame != nil else {
             firstFrame = nf
@@ -486,6 +539,46 @@ final class ScrollCaptureSession: NSObject {
                 + " cB=" + String(capturedBottom) + " dy=" + dyStr + " err=" + errStr + "\n", stderr)
         }
         if let dy = detail.dy {
+            // 停靠带检测（当前默认关闭）：行级相等判据在独立渲染的 AA 抖动下不稳定
+            // （文字行抖动 ≈30 且随 tick 波动），误激活会导致重建基准后丢内容。
+            // 已知限制：含固定顶栏的页面会长图重复顶栏（内容完整无损）；规避 = 框选避开顶栏。
+            // 正解 = 自动滚动（工具控制小步长），待后续评估
+            let stickyDetectionEnabled = false
+            if stickyDetectionEnabled, stickyH == 0, abs(dy) >= 40 {
+                let maxB = min(abs(dy), prev.h / 3, 240)
+                var b = 0
+                while b < maxB {
+                    if !Self.rowsNearEqual(prev, b, nf, b) { break }
+                    b += 1
+                }
+                // 防假激活：页面顶部空白边距滚动下也「逐行不变」——停靠带必须是有内容的行
+                // （tab 栏含文字/按钮，行内对比度高）；纯空白前缀不算
+                if b >= 30 {
+                    var contentRows = 0
+                    for r in 0..<b where Self.rowContrast(prev, r) > 40 { contentRows += 1 }
+                    if contentRows * 2 < b { b = 0 }
+                }
+                if SMDebugOn {
+                    var cs: [String] = []
+                    for r in 0..<min(b, 40) { cs.append(String(Self.rowContrast(prev, r))) }
+                    fputs("[ShotMark] sticky-detect: b=\(b) contrasts[0..\(min(b,40))]=[\(cs.joined(separator: ","))] dy=\(dy)\n", stderr)
+                }
+                // 连续 3 拍稳定才激活：页面顶部静态前缀（标题/空白）撑不过累计 120px 滚动，
+                // 真停靠栏任何滚动下都稳定
+                if b >= 30 { stickyStreak += 1 } else { stickyStreak = 0 }
+                if b >= 30, stickyStreak >= 3 {
+                    stickyStreak = 0
+                    activateSticky(b)
+                    let redetail = Self.scrollDeltaDetailed(prev: lastFrame!, new: nf)
+                    if let dy2 = redetail.dy {
+                        let appended2 = applyMatch(dy: dy2, nf: nf)
+                        debugLog(detail: redetail, appended: appended2)
+                        return
+                    }
+                    nilStreak = 1
+                    return
+                }
+            }
             let prevPos = lastPos
             let appended = applyMatch(dy: dy, nf: nf)
             if appended == 0 {
