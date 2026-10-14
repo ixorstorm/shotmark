@@ -160,8 +160,8 @@ final class ScrollCaptureSession: NSObject {
     /// 失速自救：把当前帧到整幅已拼长图里重锚定。
     /// 用户快滚甩过头（位移超出帧间量程）后，只要回滚到已拼过的任何位置，就能认出并续接。
     /// 粗搜在 1/4 降采样长图上做（步长 8 小行 = 32 全行），命中后用既有的全分辨率闸门匹配器验证。
-    private func tryReanchor(nf: Frame) -> (Frame, Int, ScrollDeltaDetail)? {
-        guard Date().timeIntervalSince(lastReanchorAt) > reanchorMinInterval else { return nil }
+    private func tryReanchor(nf: Frame, force: Bool = false) -> (Frame, Int, ScrollDeltaDetail)? {
+        guard force || Date().timeIntervalSince(lastReanchorAt) > reanchorMinInterval else { return nil }
         let totalH = capturedBottom - capturedTop
         guard totalH > nf.h else { return nil }   // 长图还没一帧高，无从锚起
         lastReanchorAt = Date()
@@ -290,8 +290,48 @@ final class ScrollCaptureSession: NSObject {
             debugLog(detail: detail, appended: 0)
             return   // 未匹配（滚动过快/低纹理）：保持 prev，下拍重试
         }
-        let appended = applyMatch(dy: dy, nf: nf)
+        // 跳帧恢复（滚轮惯性场景实测断缝根因）：期间有过 dy=nil，lastFrame 已过期——
+        // 对过期参照匹配出的 dy 不可信，必须先过长图底部接缝验证；不符则强制重锚定到长图
+        var vdy = dy
+        if nilStreak > 0 {
+            if let v = verifySeam(nf: nf, dy: vdy) {
+                vdy = v
+            } else if let (slice, pos, d2) = tryReanchor(nf: nf, force: true), let dy2 = d2.dy {
+                lastFrame = slice
+                lastPos = pos
+                let ap = applyMatch(dy: dy2, nf: nf)
+                debugLog(detail: d2, appended: ap)
+                return
+            } else {
+                // 新帧在长图之外且锚不上：内容确实跳过了，诚实放弃这一帧
+                debugLog(detail: detail, appended: 0)
+                return
+            }
+        }
+        let appended = applyMatch(dy: vdy, nf: nf)
         debugLog(detail: detail, appended: appended)
+    }
+
+    /// 跳帧恢复的接缝验证：新帧与长图重叠部分，必须和长图底部实际内容一致。
+    /// 通过 → 返回原 dy；不符/无法验证且风险高 → nil（调用方强制重锚定）。
+    private func verifySeam(nf: Frame, dy: Int) -> Int? {
+        guard let acc = accCache, acc.top == capturedTop, acc.bottom == capturedBottom else { return dy }
+        let pAbs = lastPos + dy
+        guard pAbs + nf.h > capturedBottom else { return dy }   // 整帧都在已拼区域内（重游）：无接缝
+        var L = min(300, nf.h, capturedBottom - pAbs)
+        guard L >= 60 else { return nil }                        // 与长图重叠不足：证据不够，须重锚定
+        var nfLo = capturedBottom - pAbs - L
+        if nfLo < 0 { L += nfLo; nfLo = 0 }
+        guard L >= 60,
+              let bandCG = acc.cg.cropping(to: CGRect(x: 0, y: acc.cg.height - L, width: nf.w, height: L)),
+              let nfCG = nf.cg.cropping(to: CGRect(x: 0, y: nfLo, width: nf.w, height: L)) else { return nil }
+        let band = Frame(bandCG)
+        let nfPart = Frame(nfCG)
+        let seamErr = Self.stripError(prev: band, new: nfPart, dy: 0)
+        let line = "[ShotMark] seam verify: L=" + String(L) + " err=" + String(format: "%.2f", seamErr)
+            + (seamErr <= 3.0 ? " pass" : " FAIL -> reanchor")
+        fputs(line + "\n", stderr)
+        return seamErr <= 3.0 ? dy : nil
     }
 
     /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
