@@ -486,7 +486,57 @@ final class ScrollCaptureSession: NSObject {
                 + " cB=" + String(capturedBottom) + " dy=" + dyStr + " err=" + errStr + "\n", stderr)
         }
         if let dy = detail.dy {
+            let prevPos = lastPos
             let appended = applyMatch(dy: dy, nf: nf)
+            if appended == 0 {
+                // 零追加 = 帧声称完全在已拼区域内（纯重游）。验伪：帧内容必须与长图该位置一致。
+                // 实测事故（成员列表复刻 B 场景）：快甩 500 超量程 → 匹配器错锁一个周期（dy=-220,
+                // err 0.89）→ 账本被拖进已拼区域 → 后续所有帧再也拼不上（内容全丢）。
+                let lo = max(capturedTop, lastPos)
+                let hi = min(capturedBottom, lastPos + nf.h)
+                var phantom = false
+                if hi - lo >= 120, let ref = compositeRows(lo, hi - lo),
+                   let nfPart = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: hi - lo)) {
+                    // ⚠️ 度量标定（成员列表复刻 B 场景实测）：
+                    // stripErrorInk：暗页全量 informative，背景稀释 → phantom 0.78 与真重游 0.00 难分
+                    // mismatchRatio：240 周期卡片结构下行级「内容/空白」模式两边天然对齐 → 0.01 失效
+                    // plain stripError：文字错位直接进幅值 → 真重游 ≈ 0，幻影（错位半周期）显著
+                    let e = Self.stripError(prev: ref, new: Frame(nfPart), dy: 0)
+                    phantom = e > 0.15
+                    if SMDebugOn {
+                        fputs("[ShotMark] revisit-verify: err=" + String(format: "%.2f", e)
+                            + " lo=" + String(lo) + " hi=" + String(hi)
+                            + " lastPos=" + String(lastPos) + (phantom ? " PHANTOM" : "") + "\n", stderr)
+                    }
+                }
+                if phantom {
+                    // 撤销账本，本拍直接重定位恢复（内容还在，只是匹配器被周期性骗了）
+                    lastPos = prevPos
+                    lastFrame = prev
+                    if let o = relocateAgainstBottomBand(nf: nf) ?? relocateAgainstTopBand(nf: nf) {
+                        let newBelow = (o + nf.h) - capturedBottom
+                        let newAbove = capturedTop - o
+                        let dup = newBelow > 40 ? duplicateNearBottom(nf: nf, o: o)
+                                : (newAbove > 40 ? duplicateNearTop(nf: nf, o: o) : false)
+                        if !dup {
+                            let ap = applyMatch(dy: o - lastPos, nf: nf)
+                            nilStreak = 0
+                            borderView?.warning = nil
+                            let line = "[ShotMark] phantom-recovered: o=" + String(o) + " append=" + String(ap)
+                            fputs(line + "\n", stderr)
+                            return
+                        }
+                        // 重复：只校准账本
+                        lastFrame = nf
+                        lastPos = o
+                        nilStreak = 0
+                        return
+                    }
+                    // 重定位也没锚上：放弃本帧，进入恢复模式等回滚
+                    nilStreak = max(nilStreak, 1)
+                    return
+                }
+            }
             debugLog(detail: detail, appended: appended)
             return
         }
@@ -757,8 +807,11 @@ final class ScrollCaptureSession: NSObject {
         if overlap >= 120 {
             let bandH = overlap / 3
             for b in 0..<3 {
-                let lo = fine + b * bandH
-                let hi = (b == 2) ? overlap - 1 : (fine + (b + 1) * bandH - 1)
+                // ⚠️ 带坐标必须是 new 帧系 [0, overlap)：stripErrorInk 内部 prev 行 = dy + r。
+                // 实测事故（成员列表复刻跑分器抓获）：原写法 lo/hi 带 fine 前缀（带2 又没有），
+                // prev 行索引双重加 fine → 越界读垃圾（dy=393 时读到 854/600）→ 闸门判据全废 → 拼错
+                let lo = b * bandH
+                let hi = (b == 2) ? overlap - 1 : (b + 1) * bandH - 1
                 let eAtFine = stripErrorInk(prev: prev, new: new, dy: fine, rowLo: lo, rowHi: hi)
                 guard eAtFine > 30 else { continue }   // 这带已近乎全等，无需检查
                 // 该带在双向全域找自己的最优 dy（负 dy 时 prev 行号 d+r 需在界内，按交集裁剪）
@@ -908,6 +961,11 @@ final class ScrollCaptureSession: NSObject {
                 while r <= rowHi {
                     let pr = (dy + r) * prev.bpr
                     let nr = r * new.bpr
+                    if dy + r < 0 || dy + r >= prev.h || r >= new.h {
+                        fputs("OOB: dy=\(dy) r=\(r) prev.h=\(prev.h) new.h=\(new.h) prev.bpr=\(prev.bpr) new.bpr=\(new.bpr) rowLo=\(rowLo) rowHi=\(rowHi)\n", stderr)
+                        r += rowStep
+                        continue
+                    }
                     var c = 0
                     while c < prev.w {
                         let i = pr + c * 4, j = nr + c * 4

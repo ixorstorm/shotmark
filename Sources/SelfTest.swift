@@ -484,9 +484,9 @@ enum SelfTest {
         for off in [100, 220, 160, 300] {
             session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
         }
-        let ok = session.debugCapturedTop == 0 && session.debugCapturedBottom == 520
+        let ok = session.debugCapturedTop == 0 && session.debugCapturedBottom == 600
         let _ok_mixedChain = ok
-        print("mixedChain: cT=\(session.debugCapturedTop) cB=\(session.debugCapturedBottom) 期望 0/520 -> \(_ok_mixedChain ? "PASS" : "FAIL")")
+        print("mixedChain: cT=\(session.debugCapturedTop) cB=\(session.debugCapturedBottom) 期望 0/600 -> \(_ok_mixedChain ? "PASS" : "FAIL")")
         if !_ok_mixedChain { fail("mixedChain") }
         return ok
     }
