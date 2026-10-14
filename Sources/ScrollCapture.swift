@@ -312,6 +312,7 @@ final class ScrollCaptureSession: NSObject {
         debugLog(detail: detail, appended: appended)
     }
 
+
     /// 跳帧恢复的接缝验证：新帧与长图重叠部分，必须和长图底部实际内容一致。
     /// 通过 → 返回原 dy；不符/无法验证且风险高 → nil（调用方强制重锚定）。
     private func verifySeam(nf: Frame, dy: Int) -> Int? {
@@ -749,3 +750,4 @@ final class ScrollBorderView: NSView {
         NSString(string: hint).draw(at: CGPoint(x: bar.minX + 10, y: bar.minY + 5), withAttributes: attrs)
     }
 }
+
