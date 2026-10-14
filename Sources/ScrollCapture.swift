@@ -299,6 +299,147 @@ final class ScrollCaptureSession: NSObject {
         }
     }
 
+    /// 从 segments 组装长图的 [absTop, absTop+height) 行段（行级拷贝，零坐标系歧义）
+    private func compositeRows(_ absTop: Int, _ height: Int) -> Frame? {
+        let absBottom = absTop + height
+        guard absTop >= capturedTop, absBottom <= capturedBottom, let first = segments.first else { return nil }
+        let w = first.1.width
+        let bpr = w * 4
+        var data = [UInt8](repeating: 235, count: bpr * height)
+        for (pos, cg) in segments {
+            let seg = Frame(cg)
+            let lo = max(pos, absTop)
+            let hi = min(pos + seg.h, absBottom)
+            guard hi > lo else { continue }
+            let srcStart = (lo - pos) * seg.bpr
+            let len = (hi - lo) * seg.bpr
+            let piece = seg.data.subdata(in: srcStart..<srcStart+len)
+            let dstStart = (lo - absTop) * bpr
+            data.replaceSubrange(dstStart..<dstStart+len, with: piece)
+        }
+        return frameFromRows(data, w: w, h: height)
+    }
+
+    /// 从 top-origin 行数据组装 Frame（缓冲快照，零坐标系歧义）
+    private func frameFromRows(_ data: [UInt8], w: Int, h: Int) -> Frame? {
+        var d = data
+        let bpr = w * 4
+        var cgOut: CGImage?
+        d.withUnsafeMutableBytes { ptr in
+            guard let base = ptr.baseAddress,
+                  let ctx = CGContext(data: base, width: w, height: h,
+                                      bitsPerComponent: 8, bytesPerRow: bpr,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            cgOut = ctx.makeImage()
+        }
+        guard let cg = cgOut else { return nil }
+        return Frame(cg)
+    }
+
+    /// 重复检测：候选新增头部若能与长图尾部邻域（capturedBottom - 2H … capturedBottom）任一偏移对齐，
+    /// 则为已拼内容的重复（均匀列表来回滚的歧义定位所致），不拼。
+    private func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
+        let headTop = capturedBottom
+        let len = min(220, o + nf.h - headTop)
+        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: headTop - o, width: nf.w, height: len)) else { return false }
+        let cand = Frame(candCG)
+        let searchTop = max(capturedTop, capturedBottom - 2 * nf.h)
+        guard let ref = compositeRows(searchTop, capturedBottom - searchTop) else { return false }
+        var best = 1.0
+        var bestOff = -1
+        var off = 0
+        let maxOff = ref.h - len
+        while off <= maxOff {
+            let e = Self.mismatchRatio(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            if e < best { best = e; bestOff = off }
+            off += 8
+        }
+        let line = "[ShotMark] dupBottom check: mismatch=" + String(format: "%.2f", best) + " at composite row " + String(searchTop + bestOff)
+        fputs(line + "\n", stderr)
+        return best < 0.15
+    }
+
+    /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复
+    private func duplicateNearTop(nf: Frame, o: Int) -> Bool {
+        let len = min(220, capturedTop - o)
+        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
+        let cand = Frame(candCG)
+        let searchH = min(capturedBottom - capturedTop, 2 * nf.h)
+        guard let ref = compositeRows(capturedTop, searchH) else { return false }
+        var best = 1.0
+        var bestOff = -1
+        var off = 0
+        let maxOff = ref.h - len
+        while off <= maxOff {
+            let e = Self.mismatchRatio(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            if e < best { best = e; bestOff = off }
+            off += 8
+        }
+        return best < 0.15
+    }
+
+    /// 下滚甩出恢复：长图底部带 vs 新帧头部对齐，返回帧顶绝对位置 o（锐利最小值判据）。
+    private func relocateAgainstBottomBand(nf: Frame) -> Int? {
+        let B = min(300, max(120, capturedBottom - capturedTop))
+        guard capturedBottom - capturedTop >= 60 else { return nil }
+        var bestO = Int.min
+        var bestErr = Double.greatestFiniteMagnitude
+        var errSum = 0.0
+        var errN = 0
+        // 候选重叠长度 ovL ∈ [60, min(B, nf.h)]：长图底 ovL 行 vs 新帧顶 ovL 行
+        var ovL = 60
+        let ovMax = min(B, nf.h)
+        while ovL <= ovMax {
+            guard let bandPart = compositeRows(capturedBottom - ovL, ovL),
+                  let nfTop = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: ovL)) else { ovL += 2; continue }
+            let e = Self.stripErrorInk(prev: bandPart, new: Frame(nfTop), dy: 0, rowLo: 0, rowHi: ovL - 1)
+            if e < bestErr { bestErr = e; bestO = capturedBottom - ovL }
+            errSum += e; errN += 1
+            ovL += 2
+        }
+        let meanErr = errN > 0 ? errSum / Double(errN) : .greatestFiniteMagnitude
+        if SMDebugOn {
+            let l = "[ShotMark] relocateBottom: bestO=" + String(bestO) + " bestErr=" + String(format: "%.2f", bestErr)
+                + " meanErr=" + String(format: "%.2f", meanErr)
+            fputs(l + "\n", stderr)
+        }
+        guard bestO != Int.min, bestErr < 150, bestErr < 0.5 * meanErr else { return nil }
+        return bestO
+    }
+
+    /// 上滚前插恢复：把长图头部带（前 B 行）与新帧底部对齐，返回帧顶的绝对位置 o。
+    /// o 可小于 capturedTop（新内容在上方）→ 前插；找不到返回 nil。
+    private func relocateAgainstTopBand(nf: Frame) -> Int? {
+        let B = min(300, max(120, capturedBottom - capturedTop))
+        guard let head = compositeRows(capturedTop, B) else { return nil }
+        let headTop = capturedTop   // head 即长图 [capturedTop, capturedTop+B)
+        var bestO = Int.min
+        var bestErr = Double.greatestFiniteMagnitude
+        var errSum = 0.0
+        var errN = 0
+        // 帧底部 L 行（src 段 [o+nf.h-L, o+nf.h)）↔ head 顶部 L 行（[capturedTop, capturedTop+L)）
+        // L 即重叠行数；对齐时 o = capturedTop + L - nf.h
+        var L = 60
+        let LMax = min(B, nf.h - 60)
+        while L <= LMax {
+            guard let nfBottom = nf.cg.cropping(to: CGRect(x: 0, y: nf.h - L, width: nf.w, height: L)),
+                  let headPart = head.cg.cropping(to: CGRect(x: 0, y: 0, width: head.w, height: L)) else { L += 2; continue }
+            let e = Self.stripErrorInk(prev: Frame(headPart), new: Frame(nfBottom), dy: 0, rowLo: 0, rowHi: L - 1)
+            if e < bestErr { bestErr = e; bestO = capturedTop + L - nf.h }
+            errSum += e; errN += 1
+            L += 2
+        }
+        let meanErr = errN > 0 ? errSum / Double(errN) : .greatestFiniteMagnitude
+        if SMDebugOn {
+            let l = "[ShotMark] relocateTop: bestO=" + String(bestO) + " bestErr=" + String(format: "%.2f", bestErr)
+                + " meanErr=" + String(format: "%.2f", meanErr)
+            fputs(l + "\n", stderr)
+        }
+        guard bestO != Int.min, bestErr < 150, bestErr < 0.5 * meanErr else { return nil }
+        return bestO
+    }
+
     /// 帧处理（internal 便于离线自检直接驱动）
     /// 语义（ShareX 红停模式）：小位移可靠追踪；追踪丢失 = 立即收尾出图 + 提示从断点重来。
     /// 不做任何启发式放置——均匀列表上的歧义定位会产生重复/错位（实测多轮教训）。
@@ -329,10 +470,6 @@ final class ScrollCaptureSession: NSObject {
             debugLog(detail: detail, appended: appended)
             return
         }
-        // 匹配失败分级处理：
-        // ① tex=0（重叠区全白/纯色，无配准信息）→ 视为未滚动空过，不截断（空白区长度已在上帧范围内）
-        // ② 重锚定一次（回滚续接）
-        // ③ 连续 3 拍仍失败 → 截断收尾（绝不启发式放置——均匀列表歧义会复制/错位，实测教训）
         // 空白帧检测：整帧墨迹占比 < 5%（纯白/纯色区域）→ 空过不截断（长图范围已含）。
         // ⚠️ 不能用 detail.tex==0 判断——闸门拒绝的匹配 tex 也是 0，会误伤重锚定
         var ink = 0, tot = 0
@@ -350,11 +487,91 @@ final class ScrollCaptureSession: NSObject {
                 r += 24
             }
         }
-        let blank = tot > 0 && ink * 20 < tot
-        if blank {
+        if tot > 0 && ink * 20 < tot {
             debugLog(detail: detail, appended: 0)
             return
         }
+
+        // 恢复模式（nilStreak > 0 = 上一拍没拼上，位置未知）：不走相对匹配，
+        // 双向重定位拿绝对位置 + 重复拦截（均匀列表来回滚的歧义会复制/错位，实测多轮教训）
+        if nilStreak > 0 {
+            // 底部重定位（下滚甩出后回位）：帧与长图底部对齐
+            if let o = relocateAgainstBottomBand(nf: nf) {
+                let newBelow = (o + nf.h) - capturedBottom
+                if newBelow > 40 {
+                    if duplicateNearBottom(nf: nf, o: o) {
+                        // 已拼内容的重复：不拼，只把账本校准到真实位置
+                        lastFrame = nf
+                        lastPos = o
+                        nilStreak = 0
+                        borderView?.warning = nil
+                        let line = "[ShotMark] dup-bottom: o=" + String(o) + " 跳过重复拼接"
+                        fputs(line + "\n", stderr)
+                        return
+                    }
+                    let ap = applyMatch(dy: o - lastPos, nf: nf)
+                    nilStreak = 0
+                    borderView?.warning = nil
+                    let line = "[ShotMark] relocated: o=" + String(o) + " append=" + String(ap)
+                    fputs(line + "\n", stderr)
+                    return
+                }
+                // 纯重游（整帧在已拼区域内）：只校准账本
+                lastFrame = nf
+                lastPos = o
+                nilStreak = 0
+                return
+            }
+            // 顶部重定位（上滚甩出后回位）：帧与长图头部对齐
+            if let o = relocateAgainstTopBand(nf: nf) {
+                let newAbove = capturedTop - o
+                if newAbove > 40 {
+                    if duplicateNearTop(nf: nf, o: o) {
+                        lastFrame = nf
+                        lastPos = o
+                        nilStreak = 0
+                        let line = "[ShotMark] dup-top: o=" + String(o) + " 跳过重复前插"
+                        fputs(line + "\n", stderr)
+                        return
+                    }
+                    let ap = applyMatch(dy: o - lastPos, nf: nf)
+                    nilStreak = 0
+                    borderView?.warning = nil
+                    let line = "[ShotMark] relocated-top: o=" + String(o) + " prepend=" + String(ap)
+                    fputs(line + "\n", stderr)
+                    return
+                }
+                // 纯重游：只校准账本
+                lastFrame = nf
+                lastPos = o
+                nilStreak = 0
+                return
+            }
+            // 双向都锚不上：保留最新帧作参照，计失速（3 拍后截断收尾）
+            nilStreak = min(nilStreak + 1, 50)
+            if nilStreak >= 3 {
+                broken = true
+                borderView?.warning = "滚动过快，长图已在此截断"
+                let line = "[ShotMark] tracking lost -> finish partial (nilStreak=" + String(nilStreak) + ")"
+                fputs(line + "\n", stderr)
+                Task { @MainActor in
+                    NotificationCenter.default.post(name: Notification.Name("SMTrackingLost"), object: nil)
+                    self.finish()
+                }
+            }
+            debugLog(detail: detail, appended: 0)
+            return
+        }
+
+        // 常规匹配（小位移，最精确可靠）
+        let detail2 = Self.scrollDeltaDetailed(prev: prev, new: nf)
+        debugDys.append(detail2.dy)
+        if let dy = detail2.dy {
+            let appended = applyMatch(dy: dy, nf: nf)
+            debugLog(detail: detail2, appended: appended)
+            return
+        }
+        // 小位移也失败：重锚定一次（回滚续接）；再失败 → 截断收尾
         if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
             lastFrame = slice
             lastPos = pos              // ⚠️ 必须先切到 slice 的坐标基准，dy2 才是相对它的
@@ -374,7 +591,7 @@ final class ScrollCaptureSession: NSObject {
                 self.finish()
             }
         }
-        debugLog(detail: detail, appended: 0)
+        debugLog(detail: detail2, appended: 0)
     }
 
 
@@ -572,6 +789,43 @@ final class ScrollCaptureSession: NSObject {
 
     /// prev 的 [dy..H) 与 new 的 [0..H-dy) 的平均像素差（抽样）
     /// 重叠区指定行段 [rowLo, rowHi]（含两端，相对重叠区顶部）的平均像素差
+    /// 重复检测的判别度量：两段内容的「错配行」占比（尺度无关、主题无关）。
+    /// 错配行 = 一侧有墨迹内容（行内对比度 > 60）而另一侧近乎纯色（< 25）——文字行对到空白行。
+    /// 对齐正确时 ≈ 0%；对齐错误时 ≫ 15%。渐变对渐变的天然小幅幅值差不参与判定。
+    static func mismatchRatio(prev: Frame, new: Frame, dy: Int, rowLo: Int, rowHi: Int) -> Double {
+        let rows = rowHi - rowLo + 1
+        guard rows >= 8 else { return 1.0 }
+        let colStep = max(4, prev.w / 96)
+        var mismatches = 0
+        var contentRows = 0
+        prev.data.withUnsafeBytes { pBuf in
+            new.data.withUnsafeBytes { nBuf in
+                let p = pBuf.bindMemory(to: UInt8.self)
+                let q = nBuf.bindMemory(to: UInt8.self)
+                var r = rowLo
+                while r <= rowHi {
+                    var pMin = 255, pMax = 0, qMin = 255, qMax = 0
+                    var c = 4
+                    while c < prev.w {
+                        let pi = r * prev.bpr + c * 4
+                        let qi = r * new.bpr + c * 4
+                        let pl = (Int(p[pi]) + Int(p[pi+1]) + Int(p[pi+2])) / 3
+                        let ql = (Int(q[qi]) + Int(q[qi+1]) + Int(q[qi+2])) / 3
+                        pMin = min(pMin, pl); pMax = max(pMax, pl)
+                        qMin = min(qMin, ql); qMax = max(qMax, ql)
+                        c += colStep
+                    }
+                    let pC = pMax - pMin
+                    let qC = qMax - qMin
+                    if (pC > 60 && qC < 25) || (qC > 60 && pC < 25) { mismatches += 1 }
+                    if pC > 60 || qC > 60 { contentRows += 1 }
+                    r += 1
+                }
+            }
+        }
+        return contentRows > 0 ? Double(mismatches) / Double(contentRows) : 0
+    }
+
     static func stripErrorRange(prev: Frame, new: Frame, dy: Int, rowLo: Int, rowHi: Int) -> Double {
         let rows = rowHi - rowLo + 1
         guard rows >= 8 else { return .greatestFiniteMagnitude }
