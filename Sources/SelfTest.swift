@@ -8,6 +8,34 @@ enum SelfTest {
     static var enabled: Bool { CommandLine.arguments.contains("--selftest") }
     static var liveEnabled: Bool { CommandLine.arguments.contains("--selftest-live") }
 
+    static var failures: [String] = []
+
+    /// 共享测试底图：渐变 + 每 40px 白字标签（自相似但不等价，带唯一行号）
+    static func gradientSource(W: Int, h: Int) -> CGImage {
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: h,
+                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                   isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGradient(colors: [NSColor(srgbRed: 0.2, green: 0.3, blue: 0.5, alpha: 1),
+                            NSColor(srgbRed: 0.6, green: 0.3, blue: 0.2, alpha: 1)])!
+            .draw(in: NSRect(x: 0, y: 0, width: W, height: h), angle: -90)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 20, weight: .bold),
+            .foregroundColor: NSColor.white,
+        ]
+        for y in stride(from: 10, to: h - 30, by: 40) {
+            NSString(string: "row \(y)").draw(at: CGPoint(x: 20, y: CGFloat(y)), withAttributes: attrs)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.cgImage!
+    }
+
+    /// 记录失败（run() 末尾汇总 + 非零退出，不可绕过）
+    static func fail(_ name: String) {
+        failures.append(name)
+    }
+
     static func run() {
         let outDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("shotmark-selftest")
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
@@ -15,6 +43,13 @@ enum SelfTest {
         let captured = fakeScreenshot()
         let sel = NSRect(x: 220, y: 170, width: 760, height: 440)
         let anns = demoAnnotations()
+
+        var results: [String] = []
+        func record(_ name: String, _ ok: Bool) {
+            print("  [\(ok ? "PASS" : "FAIL")] \(name)")
+            results.append(name)
+            if !ok { failures.append(name) }
+        }
 
         // 1) 导出国
         if let out = Render.export(captured: captured, selection: sel, annotations: anns) {
@@ -57,6 +92,19 @@ enum SelfTest {
         testUniformListGate()
         testTextPipeline(captured: captured, sel: sel, outDir: outDir)
         testExportRegion(captured: captured, sel: sel, outDir: outDir)
+        record("smallDelta", testSmallDelta())
+        record("zeroDelta", testZeroDelta())
+        record("boundaryDelta", testBoundaryDelta())
+        record("darkModeInk", testDarkModeInk())
+        record("prependChain", testPrependChain())
+        record("mixedChain", testMixedChain())
+
+        print("SELFTEST SUMMARY: \(failures.count) failed / \(results.count) total")
+        if !failures.isEmpty {
+            print("SELFTEST FAILED: \(failures.joined(separator: ", "))")
+            exit(1)
+        }
+        print("SELFTEST ALL PASS")
         testAnnotationTapRules(captured: captured)
         if CommandLine.arguments.contains("--selftest-live") { testLiveSession() }
     }
@@ -76,7 +124,9 @@ enum SelfTest {
         let types = pb.types ?? []
         let hasPNG = types.contains(.png)
         let hasTIFF = types.contains(.tiff)
-        print("pasteboard: png=\(hasPNG) tiff=\(hasTIFF) -> \(hasPNG && hasTIFF ? "PASS" : "FAIL")")
+        let _ok_pasteboard = hasPNG && hasTIFF
+        print("pasteboard: png=\(hasPNG) tiff=\(hasTIFF) -> \(_ok_pasteboard ? "PASS" : "FAIL")")
+        if !_ok_pasteboard { fail("pasteboard") }
     }
 
     /// 点按判定自检（用户事故 2026-10-10「圈内打字没创建文字」）：
@@ -99,7 +149,9 @@ enum SelfTest {
         // ④ 选中后：手柄 → resize
         view.selectedAnn = 0
         if case .resize = view.resolveAnnotationTap(at: CGPoint(x: 300, y: 300)) {} else { ok = false }
-        print("taprules: \(ok ? "PASS" : "FAIL")")
+        let _ok_taprules = ok
+        print("taprules: \(_ok_taprules ? "PASS" : "FAIL")")
+        if !_ok_taprules { fail("taprules") }
     }
 
     /// 导出区域正确性自检：选区四角标记必须落在导出图的四个角上
@@ -122,7 +174,9 @@ enum SelfTest {
         let topDark = topMid.0 < 120 && topMid.1 < 120 && topMid.2 < 140
         let bottomLight = bottomMid.0 > 200 && bottomMid.1 > 200 && bottomMid.2 > 200
         let ok = topDark && bottomLight
-        print("region: 顶中=\(topMid) 底中=\(bottomMid) 上深下白=\(ok) -> \(ok ? "PASS" : "FAIL")")
+        let _ok_region = ok
+        print("region: 顶中=\(topMid) 底中=\(bottomMid) 上深下白=\(ok) -> \(_ok_region ? "PASS" : "FAIL")")
+        if !_ok_region { fail("region") }
     }
 
     /// 文字标注完整管道自检：startText → 输入 → commit → 导出，验证导出图里真有字
@@ -145,7 +199,7 @@ enum SelfTest {
               let withoutText = Render.export(captured: captured, selection: sel, annotations: []),
               let cgA = withText.cgImage(forProposedRect: nil, context: nil, hints: nil),
               let cgB = withoutText.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            print("textpipe: export FAIL"); return
+            print("textpipe: export FAIL"); fail("textpipe"); return
         }
         // 整图找差异像素块（文字在哪不重要，在就行；整图均值会稀释、裁剪坐标换算易错，都绕过）
         let fa = ScrollCaptureSession.Frame(cgA)
@@ -173,7 +227,9 @@ enum SelfTest {
             }
         }
         let visible = diffs > 50
-        print("textpipe: 提交=\(committed) 差异像素=\(diffs) 区域=(\(minX),\(minY))-(\(maxX),\(maxY)) 可见=\(visible) -> \(committed && visible ? "PASS" : "FAIL")")
+        let _ok_textpipe = committed && visible
+        print("textpipe: 提交=\(committed) 差异像素=\(diffs) 区域=(\(minX),\(minY))-(\(maxX),\(maxY)) 可见=\(visible) -> \(_ok_textpipe ? "PASS" : "FAIL")")
+        if !_ok_textpipe { fail("textpipe") }
         Render.writePNG(withText, to: outDir.appendingPathComponent("textpipe.png"))
     }
 
@@ -222,18 +278,20 @@ enum SelfTest {
         session.finish()
         guard let composed = result,
               let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            print("skiprec: compose FAIL"); return
+            print("skiprec: compose FAIL"); fail("skiprec"); return
         }
         // 期望：截断语义，长图保留已捕获的 [0,640]
         let expectH = 640
         guard let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: expectH)) else {
-            print("skiprec: ref FAIL"); return
+            print("skiprec: ref FAIL"); fail("skiprec"); return
         }
         let f = ScrollCaptureSession.Frame(composedCG)
         let r = ScrollCaptureSession.Frame(refCG)
         let err = ScrollCaptureSession.stripError(prev: f, new: r, dy: 0)
         let pass = composedCG.height == expectH && err < 3.0
-        print("skiprec: 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
+        let _ok_skiprec = pass
+        print("skiprec: 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(_ok_skiprec ? "PASS" : "FAIL")")
+        if !_ok_skiprec { fail("skiprec") }
     }
 
     /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。
@@ -307,7 +365,130 @@ enum SelfTest {
         }
         _ = sem.wait(timeout: .now() + 25)
         let hit = result.contains("2026") || result.contains("Hello")
-        print("ocr: 识别=\"\(result)\" -> \(hit ? "PASS" : "FAIL")")
+        let _ok_ocr = hit
+        print("ocr: 识别=\"\(result)\" -> \(_ok_ocr ? "PASS" : "FAIL")")
+        if !_ok_ocr { fail("ocr") }
+    }
+
+    /// 小位移：dy=5/9/14 精确匹配
+    private static func testSmallDelta() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1200)
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        for off in [0, 5, 14, 23] {
+            session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
+        }
+        let ok = session.debugLastPos == 23
+        let _ok_smallDelta = ok
+        print("smallDelta: lastPos=\(session.debugLastPos) 期望 23 -> \(_ok_smallDelta ? "PASS" : "FAIL")")
+        if !_ok_smallDelta { fail("smallDelta") }
+        return ok
+    }
+
+    /// 零位移：静止帧 dy=0 幂等（不增长不前插）
+    private static func testZeroDelta() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1200)
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 100, width: W, height: FH))!))
+        let before = session.debugCapturedBottom
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 100, width: W, height: FH))!))
+        let ok = session.debugCapturedBottom == before && session.debugCapturedTop == 0
+        let _ok_zeroDelta = ok
+        print("zeroDelta: cB=\(session.debugCapturedBottom) cT=\(session.debugCapturedTop) 幂等 -> \(_ok_zeroDelta ? "PASS" : "FAIL")")
+        if !_ok_zeroDelta { fail("zeroDelta") }
+        return ok
+    }
+
+    /// 边界位移：dy = maxDelta（量程顶格）仍须精确匹配（边界否决闸门不误杀真对齐）
+    private static func testBoundaryDelta() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 0, width: W, height: FH))!))
+        let maxDelta = FH - max(100, FH / 4)
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: maxDelta, width: W, height: FH))!))
+        let ok = session.debugLastPos == maxDelta
+        let _ok_boundaryDelta = ok
+        print("boundaryDelta: lastPos=\(session.debugLastPos) 期望 \(maxDelta) -> \(_ok_boundaryDelta ? "PASS" : "FAIL")")
+        if !_ok_boundaryDelta { fail("boundaryDelta") }
+        return ok
+    }
+
+    /// 暗色主题：亮块互排的错配行占比在暗色下同样有效
+    private static func testDarkModeInk() -> Bool {
+        let W = 400, H = 400
+        func make(_ topDark: Bool) -> CGImage {
+            let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: H,
+                                       bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                       isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            // A：暗底 + 中部亮暗条纹带（行内对比度 > 60）；B：亮底 + 中部暗条纹带（位置不同）
+            (topDark ? NSColor(white: 0.08, alpha: 1) : NSColor(white: 0.92, alpha: 1)).setFill()
+            NSRect(x: 0, y: 0, width: W, height: H).fill()
+            // A 条纹带占满中部；B 条纹带只占下半 → A 的部分内容行对到 B 的纯色行 = 错配行
+            let bandY: CGFloat = topDark ? 40 : 0
+            let bandH: CGFloat = topDark ? CGFloat(H - 80) : CGFloat(H - 80) / 2
+            var col = 0
+            while col < W {
+                let on = (col / 24) % 2 == 0
+                let c: CGFloat = topDark ? (on ? 0.9 : 0.15) : (on ? 0.1 : 0.85)
+                NSColor(white: c, alpha: 1).setFill()
+                NSRect(x: CGFloat(col), y: bandY, width: 24, height: bandH).fill()
+                col += 24
+            }
+            NSGraphicsContext.restoreGraphicsState()
+            return rep.cgImage!
+        }
+        let a = make(true), b = make(false)
+        let mr = ScrollCaptureSession.mismatchRatio(prev: ScrollCaptureSession.Frame(a), new: ScrollCaptureSession.Frame(b), dy: 0, rowLo: 0, rowHi: H - 1)
+        let ok = mr > 0.15
+        let mrStr = String(format: "%.2f", mr)
+        let _ok_darkModeInk = ok
+        print("darkModeInk: mismatchRatio=\(mrStr) -> \(_ok_darkModeInk ? "PASS" : "FAIL")")
+        if !_ok_darkModeInk { fail("darkModeInk") }
+        return ok
+    }
+
+    /// 前插链：上滚两帧连续前插（capturedTop 递减，内容不丢）
+    private static func testPrependChain() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 400, width: W, height: FH))!))
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 300, width: W, height: FH))!))
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 200, width: W, height: FH))!))
+        let ok = session.debugCapturedTop == -200 && session.debugCapturedBottom == 400
+        let _ok_prependChain = ok
+        print("prependChain: cT=\(session.debugCapturedTop) cB=\(session.debugCapturedBottom) 期望 -200/400 -> \(_ok_prependChain ? "PASS" : "FAIL")")
+        if !_ok_prependChain { fail("prependChain") }
+        return ok
+    }
+
+    /// 混合链：下滚 2 帧 + 上滚 1 帧 + 下滚 1 帧（水位线双向推进，内容不丢不重）
+    private static func testMixedChain() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        for off in [100, 220, 160, 300] {
+            session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
+        }
+        let ok = session.debugCapturedTop == 0 && session.debugCapturedBottom == 520
+        let _ok_mixedChain = ok
+        print("mixedChain: cT=\(session.debugCapturedTop) cB=\(session.debugCapturedBottom) 期望 0/520 -> \(_ok_mixedChain ? "PASS" : "FAIL")")
+        if !_ok_mixedChain { fail("mixedChain") }
+        return ok
     }
 
     /// 标注移动/缩放自检：translated + resized（文字按比例、形状重设、箭头动端点）
@@ -332,7 +513,9 @@ enum SelfTest {
         ar.p1 = CGPoint(x: 0, y: 0); ar.p2 = CGPoint(x: 100, y: 100)
         let arMoved = ar.resized(handle: 2, from: ar.bounds, to: CGPoint(x: 200, y: 200))
         ok = ok && arMoved.p2 == CGPoint(x: 200, y: 200) && arMoved.p1 == CGPoint(x: 0, y: 0)
-        print("transforms: \(ok ? "PASS" : "FAIL")")
+        let _ok_transforms = ok
+        print("transforms: \(_ok_transforms ? "PASS" : "FAIL")")
+        if !_ok_transforms { fail("transforms") }
     }
 
     /// 滚动会话全屏暗色层渲染自检（快照 + 挖洞 + 边框 + 提示条）
@@ -436,16 +619,22 @@ enum SelfTest {
         // 上滚（内容下移）：应识别为反向 -87（真匹配，不是幻影）；幻影的防法在「全白对齐被纹理闸门过滤」
         let up = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(258), new: frame(171))
         let p1 = up.dy == -87
-        print("whitematch: 上滚 dy=\(up.dy.map(String.init) ?? "nil") tex=\(up.tex) -> \(p1 ? "PASS" : "FAIL")")
+        let _wm0 = p1
+        print("whitematch: 上滚 dy=\(up.dy.map(String.init) ?? "nil") tex=\(up.tex) -> \(_wm0 ? "PASS" : "FAIL")")
+        if !_wm0 { fail("whitematch") }
         // 正常下滚：稀疏文本提供足够纹理，仍应正确匹配
         let down = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(87))
         let p2 = down.dy == 87
-        print("whitematch: 下滚 dy=\(down.dy.map(String.init) ?? "nil") tex=\(down.tex) -> \(p2 ? "PASS" : "FAIL")")
+        let _wm1 = p2
+        print("whitematch: 下滚 dy=\(down.dy.map(String.init) ?? "nil") tex=\(down.tex) -> \(_wm1 ? "PASS" : "FAIL")")
+        if !_wm1 { fail("whitematch") }
         // 幻影回归（真实事故 2026-10-09：dy=660 顶满边界、err 5.95 擦边过线 → 660 行错位追加）：
         // 大跳变两帧零重叠，精确匹配必须 nil（旧模糊匹配会瞎猜）
         let phantom = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(1100))
         let p3 = phantom.dy == nil
-        print("whitematch: 大跳变零重叠 dy=\(phantom.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",phantom.fineErr)) tex=\(phantom.tex) -> \(p3 ? "PASS" : "FAIL")")
+        let _wm2 = p3
+        print("whitematch: 大跳变零重叠 dy=\(phantom.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",phantom.fineErr)) tex=\(phantom.tex) -> \(_wm2 ? "PASS" : "FAIL")")
+        if !_wm2 { fail("whitematch") }
         // 噪声回归（SCK 分数像素 sourceRect 重采样/光标闪烁）：帧内撒 ±8 噪声点，仍应匹配 dy=87
         guard let noisyRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: FH,
                                               bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -466,7 +655,9 @@ enum SelfTest {
         let noisy = ScrollCaptureSession.Frame(noisyRep.cgImage!)
         let noisyMatch = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: noisy)
         let p4 = noisyMatch.dy == 87
-        print("whitematch: 噪声帧 dy=\(noisyMatch.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",noisyMatch.fineErr)) tex=\(noisyMatch.tex) -> \(p4 ? "PASS" : "FAIL")")
+        let _wm3 = p4
+        print("whitematch: 噪声帧 dy=\(noisyMatch.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",noisyMatch.fineErr)) tex=\(noisyMatch.tex) -> \(_wm3 ? "PASS" : "FAIL")")
+        if !_wm3 { fail("whitematch") }
     }
 
     /// 造 1600px 长图，用滑动窗口模拟滚动帧，验证匹配 + 拼接还原
@@ -512,17 +703,19 @@ enum SelfTest {
         session.finish()
         guard let composed = result,
               let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            print("stitch: compose FAIL"); return
+            print("stitch: compose FAIL"); fail("stitch"); return
         }
         // 期望：覆盖源图 [0, 258+FH) 共 658 行（上滚越过首帧的内容被前插进来）
         let expectH = FH + 258
         guard let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: expectH)) else {
-            print("stitch: ref FAIL"); return
+            print("stitch: ref FAIL"); fail("stitch"); return
         }
         let err = ScrollCaptureSession.stripError(prev: ScrollCaptureSession.Frame(composedCG),
                                                   new: ScrollCaptureSession.Frame(refCG), dy: 0)
         let pass = composedCG.height == expectH && err < 3.0
-        print("stitch: 双向滚动 offsets=\(offsets) 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
+        let _ok_stitch = pass
+        print("stitch: 双向滚动 offsets=\(offsets) 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(_ok_stitch ? "PASS" : "FAIL")")
+        if !_ok_stitch { fail("stitch") }
         let out = NSImage(size: NSSize(width: W, height: composedCG.height))
         out.addRepresentation(NSBitmapImageRep(cgImage: composedCG))
         Render.writePNG(out, to: outDir.appendingPathComponent("scroll-stitch.png"))

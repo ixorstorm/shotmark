@@ -1,0 +1,21 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          xcrun swiftc -swift-version 5 -O \
+            -sdk $(xcrun --sdk macosx --show-sdk-path) \
+            -target arm64-apple-macosx14.0 \
+            -o ShotMarkTest Sources/*.swift \
+            -framework AppKit -framework Carbon -framework ScreenCaptureKit -framework Vision
+      - name: Run selftest
+        run: ./ShotMarkTest --selftest

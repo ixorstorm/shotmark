@@ -88,6 +88,8 @@ final class ScrollCaptureSession: NSObject {
     var debugDys: [Int?] = []
     /// 自检用：当前锚定位置
     var debugLastPos: Int { lastPos }
+    var debugCapturedTop: Int { capturedTop }
+    var debugCapturedBottom: Int { capturedBottom }
     /// 自检时关掉落盘日志（避免污染正式 shotmark-scroll.log）
     var loggingEnabled = true
     /// 重锚定缓存（segments 变化即失效）
@@ -203,11 +205,16 @@ final class ScrollCaptureSession: NSObject {
     }
 
     /// 小尺度偏置误差：acc 的 [off, off+nf.h) vs nf 的 [0, nf.h)
+    /// 粗匹配误差：按行去趋势（减行均值）后再比。
+    /// 实测教训（prependChain 测试抓获）：慢渐变页面上，未去趋势的粗匹配被低频亮度差主导——
+    /// 梯度错位 40px 的代价（2.5）小于文本对齐的代价（6.4），粗扫锁死在错误周期上，
+    /// 细扫 ±8 够不到 40px 外的真锚点。去趋势后：垂直亮度漂移消失，行内结构（文字/边框）主导。
     private static func errAtOffset(acc: Frame, nf: Frame, off: Int) -> Double {
         let overlap = nf.h
         let rowStep = max(1, overlap / 48)
         let colStep = max(2, nf.w / 64)
         var sum = 0.0, n = 0.0
+        // 每行均值（供去趋势）：只对参与比较的行算
         acc.data.withUnsafeBytes { aBuf in
             nf.data.withUnsafeBytes { nBuf in
                 let a = aBuf.bindMemory(to: UInt8.self)
@@ -216,11 +223,24 @@ final class ScrollCaptureSession: NSObject {
                 while r < overlap {
                     let ar = (off + r) * acc.bpr
                     let nr = r * nf.bpr
+                    var aSum = 0, bSum = 0, cn = 0
                     var c = 0
                     while c < nf.w {
                         let i = ar + c * 4, j = nr + c * 4
-                        sum += Double(abs(Int(a[i]) - Int(b[j])) + abs(Int(a[i+1]) - Int(b[j+1])) + abs(Int(a[i+2]) - Int(b[j+2])))
-                        n += 3
+                        aSum += Int(a[i]) + Int(a[i+1]) + Int(a[i+2])
+                        bSum += Int(b[j]) + Int(b[j+1]) + Int(b[j+2])
+                        cn += 3
+                        c += colStep
+                    }
+                    let aMean = Double(aSum) / Double(cn)
+                    let bMean = Double(bSum) / Double(cn)
+                    c = 0
+                    while c < nf.w {
+                        let i = ar + c * 4, j = nr + c * 4
+                        let d = abs((Double(a[i]) + Double(a[i+1]) + Double(a[i+2])) - aMean
+                                  - ((Double(b[j]) + Double(b[j+1]) + Double(b[j+2])) - bMean))
+                        sum += d
+                        n += 1
                         c += colStep
                     }
                     r += rowStep
@@ -697,18 +717,33 @@ final class ScrollCaptureSession: NSObject {
             }
             dy += 8
         }
-        guard let (best, bestErr) = errs.min(by: { $0.err < $1.err }) else { return none }
-        let secondErr = errs.filter { abs($0.dy - best) > 8 }.map { $0.err }.min() ?? .greatestFiniteMagnitude
-        // 精扫（±8 步长 1）
-        var fine = best, fineErr = bestErr
-        let lo = max(0, best - 8), hi = min(maxDelta, best + 8)
-        if lo <= hi {
-            for d in lo...hi where textureScore(prev: prev, new: new, dy: d) >= 48 {
-                let e = stripError(prev: prev, new: new, dy: d)
-                if e < fineErr { fineErr = e; fine = d }
+        guard !errs.isEmpty else { return none }
+        // 多假设精扫（prependChain 测试抓获的实锤）：慢渐变页面上，文本「近失对齐」（差 4px，
+        // 字形边缘全错）的粗误差高于「根本错位 40px」——单一粗最优的 ±8 精扫够不到真锚点。
+        // 取粗扫的局部极小（≤4 个、err ≤ 2×最优）各自 ±8 精扫，全局取最优。
+        var cands: [(dy: Int, err: Double)] = []
+        for (i, e) in errs.enumerated() {
+            let prevE = i > 0 ? errs[i - 1].err : .greatestFiniteMagnitude
+            let nextE = i < errs.count - 1 ? errs[i + 1].err : .greatestFiniteMagnitude
+            if e.err <= prevE && e.err <= nextE { cands.append(e) }
+        }
+        cands.sort { $0.err < $1.err }
+        if let b0 = cands.first {
+            cands = cands.filter { $0.err <= b0.err * 2 + 1e-9 }.prefix(4).map { $0 }
+        }
+        var fine = cands.first?.dy ?? 0
+        var fineErr = cands.first?.err ?? .greatestFiniteMagnitude
+        for c in cands {
+            let lo = max(0, c.dy - 8), hi = min(maxDelta, c.dy + 8)
+            if lo <= hi {
+                for d in lo...hi where textureScore(prev: prev, new: new, dy: d) >= 48 {
+                    let e = stripError(prev: prev, new: new, dy: d)
+                    if e < fineErr { fineErr = e; fine = d }
+                }
             }
         }
         let tex = textureScore(prev: prev, new: new, dy: fine)
+        let secondErr = errs.filter { abs($0.dy - fine) > 8 }.map { $0.err }.min() ?? .greatestFiniteMagnitude
 
         // 闸门⑤：三带一致性。重叠区分三带各自验误差，任一带 err > max(3.0, fineErr*3) 即拒绝。
         // 均匀列表（卡片等高）会让错误周期在全局均值上低误差命中——独特内容（地标行）的
