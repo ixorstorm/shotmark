@@ -53,6 +53,7 @@ enum SelfTest {
         testPasteboardTypes()
         testOCR()
         testAnnotationTransforms()
+        testUniformListGate()
         testTextPipeline(captured: captured, sel: sel, outDir: outDir)
         testExportRegion(captured: captured, sel: sel, outDir: outDir)
         testAnnotationTapRules(captured: captured)
@@ -173,6 +174,58 @@ enum SelfTest {
         let visible = diffs > 50
         print("textpipe: 提交=\(committed) 差异像素=\(diffs) 区域=(\(minX),\(minY))-(\(maxX),\(maxY)) 可见=\(visible) -> \(committed && visible ? "PASS" : "FAIL")")
         Render.writePNG(withText, to: outDir.appendingPathComponent("textpipe.png"))
+    }
+
+    /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。
+    /// 构造周期 208 的卡片列表 + 唯一地标黑条：错误周期（真位移±208）在全局均值上
+    /// 低误差命中（白底稀释地标行的错位），三带一致性闸门必须拒绝、真位移必须放行。
+    private static func testUniformListGate() {
+        let W = 400, TALL = 1700, P: CGFloat = 208
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: TALL,
+                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                   isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor(white: 0.96, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: CGFloat(W), height: CGFloat(TALL)).fill()
+        // 周期卡片：每 208px 一张（灰边框 + 深色「文字条」两根）
+        var y: CGFloat = 30
+        while y < CGFloat(TALL) - 60 {
+            let card = NSRect(x: 24, y: y, width: CGFloat(W - 48), height: 150)
+            NSColor(white: 0.88, alpha: 1).setFill()
+            NSBezierPath(roundedRect: card, xRadius: 8, yRadius: 8).fill()
+            NSColor(white: 0.55, alpha: 1).setStroke()
+            NSBezierPath(rect: card).stroke()
+            NSColor(white: 0.25, alpha: 1).setFill()
+            NSRect(x: 44, y: y + 96, width: 180, height: 12).fill()
+            NSRect(x: 44, y: y + 60, width: 240, height: 12).fill()
+            y += P
+        }
+        // 唯一地标：整幅图只有一条纯黑粗条（绝对行 [980, 1010]，y-up 顶=1010）
+        NSColor.black.setFill()
+        NSRect(x: 0, y: 690, width: CGFloat(W), height: 30).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let cgFull = rep.cgImage else { print("uniformlist: rep FAIL"); return }
+
+        let H = 682
+        func frameAt(_ topFromBottom: Int) -> ScrollCaptureSession.Frame {
+            // topFromBottom = 帧顶边距底图底部的距离（y-up）；裁像素行 [TALL-top-H, TALL-top)
+            let cg = cgFull.cropping(to: CGRect(x: 0, y: TALL - topFromBottom, width: W, height: H))!
+            return ScrollCaptureSession.Frame(cg)
+        }
+        // 真位移 100：prev 顶=1082，new 顶=982（帧底分别 400 / 300）
+        let prev = frameAt(1082)
+        let new = frameAt(982)
+        let detail = ScrollCaptureSession.scrollDeltaDetailed(prev: prev, new: new)
+        // 地标黑条在 prev 内：abs 行 980-1010 → prev 顶=1082 → prev 帧 y-up 行 [72,102]
+        // 帧内行(顶部起算) = H - yUpBottom - h = 682-102-30=550..580（中带）
+        // 若匹配到错误周期（dy=100±208），地标落在某条带里必然高误差 → 必须拒绝
+        // 真位移 dy=100：地标对齐 → 放行
+        let dy = detail.dy ?? -9999
+        let ok = dy == 100
+        let errStr = String(format: "%.2f", detail.fineErr)
+        let verdict = ok ? "PASS" : "FAIL"
+        print("uniformlist: dy=\(dy) err=\(errStr) -> \(verdict)（期望 100）")
     }
 
     /// 文字识别自检：画带字的图，Vision 必须找回关键字（离线，秒级）

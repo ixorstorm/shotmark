@@ -417,7 +417,10 @@ final class ScrollCaptureSession: NSObject {
         let none = ScrollDeltaDetail(dy: nil, fineErr: .greatestFiniteMagnitude, secondErr: .greatestFiniteMagnitude, tex: 0)
         let H = prev.h
         guard new.h == H, new.w == prev.w else { return none }
-        let maxDelta = H - 60
+        // 闸门①：最小重叠 = max(100, H/4)。位移越大需要的重叠证据越多——
+        // 大位移+小重叠在均匀列表上等于没有证据（成员列表页 dy=621 重叠仅 9% 事故）
+        let minOverlap = max(100, H / 4)
+        let maxDelta = H - minOverlap
         guard maxDelta > 0 else { return ScrollDeltaDetail(dy: 0, fineErr: 0, secondErr: 0, tex: 0) }
         // 粗扫（步长 8）：纹理闸门先行，候选 tex<24 直接出局
         var errs: [(dy: Int, err: Double)] = []
@@ -440,6 +443,22 @@ final class ScrollCaptureSession: NSObject {
             }
         }
         let tex = textureScore(prev: prev, new: new, dy: fine)
+
+        // 闸门⑤：三带一致性。重叠区分三带各自验误差，任一带 err > max(3.0, fineErr*3) 即拒绝。
+        // 均匀列表（卡片等高）会让错误周期在全局均值上低误差命中——独特内容（地标行）的
+        // 高误差被白底稀释（成员列表页尾部拼错事故：dy 偏半张卡，全局 err 仅 1.24/1.51）
+        let overlap = H - fine
+        if overlap >= 120 {
+            let bandH = overlap / 3
+            var maxBandErr = 0.0
+            for b in 0..<3 {
+                let lo = b * bandH
+                let hi = (b == 2) ? overlap - 1 : (b + 1) * bandH - 1
+                maxBandErr = max(maxBandErr, stripErrorRange(prev: prev, new: new, dy: fine, rowLo: lo, rowHi: hi))
+            }
+            if maxBandErr > max(3.0, fineErr * 3) { return none }
+        }
+
         // 闸门②：贴边界的候选必须是近乎全等
         if abs(fine - maxDelta) <= 8 || fine <= 8 {
             guard fineErr < 1.5 else { return none }
@@ -484,6 +503,37 @@ final class ScrollCaptureSession: NSObject {
     }
 
     /// prev 的 [dy..H) 与 new 的 [0..H-dy) 的平均像素差（抽样）
+    /// 重叠区指定行段 [rowLo, rowHi]（含两端，相对重叠区顶部）的平均像素差
+    static func stripErrorRange(prev: Frame, new: Frame, dy: Int, rowLo: Int, rowHi: Int) -> Double {
+        let rows = rowHi - rowLo + 1
+        guard rows >= 8 else { return .greatestFiniteMagnitude }
+        let rowStep = max(1, rows / 32)
+        let colStep = max(4, prev.w / 96)
+        var sum = 0.0, n = 0.0
+        prev.data.withUnsafeBytes { pBuf in
+            new.data.withUnsafeBytes { nBuf in
+                let p = pBuf.bindMemory(to: UInt8.self)
+                let q = nBuf.bindMemory(to: UInt8.self)
+                var r = rowLo
+                while r <= rowHi {
+                    let pr = (dy + r) * prev.bpr
+                    let nr = r * new.bpr
+                    var c = 0
+                    while c < prev.w {
+                        let i = pr + c * 4, j = nr + c * 4
+                        sum += Double(abs(Int(p[i]) - Int(q[j]))
+                                      + abs(Int(p[i + 1]) - Int(q[j + 1]))
+                                      + abs(Int(p[i + 2]) - Int(q[j + 2])))
+                        n += 3
+                        c += colStep
+                    }
+                    r += rowStep
+                }
+            }
+        }
+        return n > 0 ? sum / n : .greatestFiniteMagnitude
+    }
+
     static func stripError(prev: Frame, new: Frame, dy: Int) -> Double {
         let overlap = prev.h - dy
         guard overlap > 40 else { return .greatestFiniteMagnitude }
