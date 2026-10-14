@@ -302,6 +302,17 @@ final class ScrollCaptureSession: NSObject {
                 return
             }
             let staticErr = Self.stripError(prev: prev, new: nf, dy: 0)
+            if nilStreak >= 3 {
+                // 连续 3 拍锚不上 = 内容确实跳变了（甩太快/页面跳转）。
+                // 接受不连续：整帧拼在长图尾部（有可见跳变但内容不丢），重置锚定继续
+                let ap = applyMatch(dy: capturedBottom - lastPos, nf: nf)
+                nilStreak = 0
+                borderView?.warning = "检测到画面跳变，长图此处不连续"
+                let line = "[ShotMark] discontinuity accepted: append=" + String(ap)
+                fputs(line + "\n", stderr)
+                debugLog(detail: detail, appended: ap)
+                return
+            }
             nilStreak = staticErr > 8 ? min(nilStreak + 1, 50) : 0
             lastFrame = nf   // 保留最新帧：内容在动，旧参照只会更远（nilStreak>0 标记位置未知）
             borderView?.warning = nilStreak >= 5
@@ -311,15 +322,46 @@ final class ScrollCaptureSession: NSObject {
             return
         }
         // 跳帧恢复（滚轮惯性场景实测断缝根因）：期间有过 dy=nil，lastFrame 已过期——
-        // 对过期参照匹配出的 dy 不可信，必须先过长图底部接缝验证；不符则强制重锚定到长图
+        // 对过期参照匹配出的 dy 不可信，必须先对「长图底部带」重定位拿绝对位置；
+        // 候选新增若与长图邻域对齐 = 已拼内容的重复（来回滚歧义定位），只校准账本不拼
         var vdy = dy
         if nilStreak > 0 {
             // 跳帧后 lastFrame 已过期，对它的匹配不可信——改对「长图底部带」重定位：
             // 在新帧里找长图底边的真实落点，直接得到绝对位置（不依赖 accCache/节流）
             if let o = relocateAgainstBottomBand(nf: nf) {
-                vdy = o - lastPos
-                let line = "[ShotMark] relocated: o=" + String(o) + " vdy=" + String(vdy)
-                fputs(line + "\n", stderr)
+                let newBelow = (o + nf.h) - capturedBottom
+                let newAbove = capturedTop - o
+                if newBelow > 40 {
+                    if duplicateNearBottom(nf: nf, o: o) {
+                        // 已拼内容的重复：不拼，只把账本校准到真实位置
+                        lastFrame = nf
+                        lastPos = o
+                        nilStreak = 0
+                        borderView?.warning = nil
+                        let line = "[ShotMark] dup-bottom: o=" + String(o) + " 跳过重复拼接"
+                        fputs(line + "\n", stderr)
+                        return
+                    }
+                    vdy = o - lastPos
+                    let line = "[ShotMark] relocated: o=" + String(o) + " vdy=" + String(vdy)
+                    fputs(line + "\n", stderr)
+                } else if newAbove > 40 {
+                    if duplicateNearTop(nf: nf, o: o) {
+                        lastFrame = nf
+                        lastPos = o
+                        nilStreak = 0
+                        let line = "[ShotMark] dup-top: o=" + String(o) + " 跳过重复前插"
+                        fputs(line + "\n", stderr)
+                        return
+                    }
+                    vdy = o - lastPos
+                } else {
+                    // 纯重游（整帧在已拼区域内）：只校准账本
+                    lastFrame = nf
+                    lastPos = o
+                    nilStreak = 0
+                    return
+                }
             } else {
                 // 新帧与长图无重叠（甩太远）或找不到锚点：诚实放弃这一帧
                 nilStreak = min(nilStreak + 1, 50)
@@ -329,6 +371,73 @@ final class ScrollCaptureSession: NSObject {
         }
         let appended = applyMatch(dy: vdy, nf: nf)
         debugLog(detail: detail, appended: appended)
+    }
+
+    /// 从 segments 组装长图的 [absTop, absTop+height) 行段（行级拷贝，零坐标系歧义）
+    private func compositeRows(_ absTop: Int, _ height: Int) -> Frame? {
+        let absBottom = absTop + height
+        guard absTop >= capturedTop, absBottom <= capturedBottom, let first = segments.first else { return nil }
+        let w = first.1.width
+        let bpr = w * 4
+        var data = [UInt8](repeating: 235, count: bpr * height)
+        for (pos, cg) in segments {
+            let seg = Frame(cg)
+            let lo = max(pos, absTop)
+            let hi = min(pos + seg.h, absBottom)
+            guard hi > lo else { continue }
+            let srcStart = (lo - pos) * seg.bpr
+            let len = (hi - lo) * seg.bpr
+            let piece = seg.data.subdata(in: srcStart..<srcStart+len)
+            let dstStart = (lo - absTop) * bpr
+            data.replaceSubrange(dstStart..<dstStart+len, with: piece)
+        }
+        return frameFromRows(data, w: w, h: height)
+    }
+
+    private func bottomBandFrame(_ B: Int) -> (Frame, Int)? {
+        guard capturedBottom - capturedTop >= B else { return nil }
+        let top = capturedBottom - B
+        return compositeRows(top, B).map { ($0, top) }
+    }
+
+    /// 重复检测：候选新增头部若能与长图尾部邻域（capturedBottom - 2H … capturedBottom）任一偏移对齐，
+    /// 则为已拼内容的重复（均匀列表来回滚的歧义定位所致），不拼。
+    private func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
+        let headTop = capturedBottom
+        let len = min(220, o + nf.h - headTop)
+        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: headTop - o, width: nf.w, height: len)) else { return false }
+        let cand = Frame(candCG)
+        let searchTop = max(capturedTop, capturedBottom - 2 * nf.h)
+        guard let ref = compositeRows(searchTop, capturedBottom - searchTop) else { return false }
+        var best = Double.greatestFiniteMagnitude
+        var off = 0
+        let maxOff = ref.h - len
+        while off <= maxOff {
+            let e = Self.stripErrorInk(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            if e < best { best = e }
+            off += 8
+        }
+        let line = "[ShotMark] dupBottom check: best=" + String(format: "%.2f", best)
+        fputs(line + "\n", stderr)
+        return best < 60
+    }
+
+    /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复
+    private func duplicateNearTop(nf: Frame, o: Int) -> Bool {
+        let len = min(220, capturedTop - o)
+        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
+        let cand = Frame(candCG)
+        let searchH = min(capturedBottom - capturedTop, 2 * nf.h)
+        guard let ref = compositeRows(capturedTop, searchH) else { return false }
+        var best = Double.greatestFiniteMagnitude
+        var off = 0
+        let maxOff = ref.h - len
+        while off <= maxOff {
+            let e = Self.stripErrorInk(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            if e < best { best = e }
+            off += 8
+        }
+        return best < 60
     }
 
     /// 跳帧恢复：把长图底部带（末 B 行）在新帧里重定位，返回新帧顶部的绝对位置 o。
@@ -382,26 +491,6 @@ final class ScrollCaptureSession: NSObject {
         return capturedBottom - bestR
     }
 
-    /// 长图底部 B 行的带（行级字节拷贝自 segments，零坐标系歧义）。返回 (带Frame, 带顶abs位置)。
-    private func bottomBandFrame(_ B: Int) -> (Frame, Int)? {
-        let bandTop = capturedBottom - B
-        guard bandTop >= capturedTop, let first = segments.first else { return nil }
-        let w = first.1.width
-        let bpr = w * 4
-        var data = [UInt8](repeating: 235, count: bpr * B)
-        for (pos, cg) in segments {
-            let seg = Frame(cg)
-            let lo = max(pos, bandTop)
-            let hi = min(pos + seg.h, capturedBottom)
-            guard hi > lo else { continue }
-            let srcStart = (lo - pos) * seg.bpr
-            let len = (hi - lo) * seg.bpr
-            let piece = seg.data.subdata(in: srcStart..<srcStart+len)
-            let dstStart = (lo - bandTop) * bpr
-            data.replaceSubrange(dstStart..<dstStart+len, with: piece)
-        }
-        return frameFromRows(data, w: w, h: B).map { ($0, bandTop) }
-    }
 
     /// 从 top-origin 行数据组装 Frame（缓冲快照，零坐标系歧义）
     private func frameFromRows(_ data: [UInt8], w: Int, h: Int) -> Frame? {
