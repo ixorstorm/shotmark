@@ -272,38 +272,57 @@ final class ScrollCaptureSession: NSObject {
         guard let prev = lastFrame else { return }
         let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
         debugDys.append(detail.dy)
+        if ProcessInfo.processInfo.environment["SM_DEBUG"] == "1" {
+            let dyStr = detail.dy.map { String($0) } ?? "nil"
+            let errStr = String(format: "%.2f", detail.fineErr)
+            let l = "SM tick: nilStreak=" + String(nilStreak) + " lastPos=" + String(lastPos)
+                + " cB=" + String(capturedBottom) + " dy=" + dyStr + " err=" + errStr
+            fputs(l + "\n", stderr)
+        }
         guard let dy = detail.dy else {
-            // 失速自救：先尝试把当前帧到「整幅已拼长图」里重锚定（用户回滚到已拼区域即可续命）。
-            // 锚不上才计失速——连续 5 拍且内容确实在变 → 提示回滚衔接
+            // 未匹配（滚轮惯性甩快/低纹理）。恢复顺序：
+            // ① 长图底部带重定位（惯性快滚后新帧通常仍与长图底部有重叠）
+            // ② 全图重锚定（用户回滚到已拼区域上部的情况）
+            // ③ 都失败：保留最新帧作下拍参照（内容在动，旧参照只会更远），计失速等用户回滚
+            if let o = relocateAgainstBottomBand(nf: nf) {
+                let ap = applyMatch(dy: o - lastPos, nf: nf)
+                nilStreak = 0
+                borderView?.warning = nil
+                let line = "[ShotMark] relocated(nil-path): o=" + String(o) + " append=" + String(ap)
+                fputs(line + "\n", stderr)
+                return
+            }
             if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
                 lastFrame = slice
                 lastPos = pos
                 let ap = applyMatch(dy: dy2, nf: nf)
+                nilStreak = 0
+                borderView?.warning = nil
                 debugLog(detail: d2, appended: ap)
                 return
             }
             let staticErr = Self.stripError(prev: prev, new: nf, dy: 0)
-            nilStreak = staticErr > 8 ? nilStreak + 1 : 0
+            nilStreak = staticErr > 8 ? min(nilStreak + 1, 50) : 0
+            lastFrame = nf   // 保留最新帧：内容在动，旧参照只会更远（nilStreak>0 标记位置未知）
             borderView?.warning = nilStreak >= 5
                 ? "衔接丢失 · 回滚到已拼过的画面即可自动续接"
                 : nil
             debugLog(detail: detail, appended: 0)
-            return   // 未匹配（滚动过快/低纹理）：保持 prev，下拍重试
+            return
         }
         // 跳帧恢复（滚轮惯性场景实测断缝根因）：期间有过 dy=nil，lastFrame 已过期——
         // 对过期参照匹配出的 dy 不可信，必须先过长图底部接缝验证；不符则强制重锚定到长图
         var vdy = dy
         if nilStreak > 0 {
-            if let v = verifySeam(nf: nf, dy: vdy) {
-                vdy = v
-            } else if let (slice, pos, d2) = tryReanchor(nf: nf, force: true), let dy2 = d2.dy {
-                lastFrame = slice
-                lastPos = pos
-                let ap = applyMatch(dy: dy2, nf: nf)
-                debugLog(detail: d2, appended: ap)
-                return
+            // 跳帧后 lastFrame 已过期，对它的匹配不可信——改对「长图底部带」重定位：
+            // 在新帧里找长图底边的真实落点，直接得到绝对位置（不依赖 accCache/节流）
+            if let o = relocateAgainstBottomBand(nf: nf) {
+                vdy = o - lastPos
+                let line = "[ShotMark] relocated: o=" + String(o) + " vdy=" + String(vdy)
+                fputs(line + "\n", stderr)
             } else {
-                // 新帧在长图之外且锚不上：内容确实跳过了，诚实放弃这一帧
+                // 新帧与长图无重叠（甩太远）或找不到锚点：诚实放弃这一帧
+                nilStreak = min(nilStreak + 1, 50)
                 debugLog(detail: detail, appended: 0)
                 return
             }
@@ -311,6 +330,107 @@ final class ScrollCaptureSession: NSObject {
         let appended = applyMatch(dy: vdy, nf: nf)
         debugLog(detail: detail, appended: appended)
     }
+
+    /// 跳帧恢复：把长图底部带（末 B 行）在新帧里重定位，返回新帧顶部的绝对位置 o。
+    /// 找不到（无重叠/歧义）返回 nil。带从 segments 现场绘制，不依赖 accCache/节流。
+    private func relocateAgainstBottomBand(nf: Frame) -> Int? {
+        let B = min(300, max(120, capturedBottom - capturedTop))
+        let dbg2 = ProcessInfo.processInfo.environment["SM_DEBUG"] == "1"
+        if dbg2 {
+            let l = "[ShotMark] relocate enter: B=" + String(B) + " nf=" + String(nf.w) + "x" + String(nf.h)
+                + " cT=" + String(capturedTop) + " cB=" + String(capturedBottom)
+                + " segs=" + String(segments.count)
+            fputs(l + "\n", stderr)
+        }
+        guard capturedBottom - capturedTop >= B + 60,
+              let (band, bandTop) = bottomBandFrame(B) else { return nil }
+        // 带底边在新帧内的落点 rEnd ∈ [60, nf.h]；对应帧顶 abs 位置 o = capturedBottom - rEnd
+        var bestR = -1
+        var bestErr = Double.greatestFiniteMagnitude
+        var errSum = 0.0
+        var errN = 0
+        // rEnd ∈ [60, nf.h-60]：新帧与长图至少 60px 真实重叠（防跳帧大间隙的伪锚点）
+        var rEnd = 60
+        let rEndMax = max(60, nf.h - 60)
+        while rEnd <= rEndMax {
+            let e = bandSeamErr(band: band, nf: nf, rEnd: rEnd)
+            if e < bestErr { bestErr = e; bestR = rEnd }
+            errSum += e; errN += 1
+            rEnd += 2      // 恢复路径用细步长：真对齐可能落在任意行（步长 8 会跳过，实测 rEnd=140 漏检）
+        }
+        // 精扫 ±8
+        if bestR > 0 {
+            var r = max(60, bestR - 8)
+            let hi = min(nf.h - 60, bestR + 8)
+            while r <= hi {
+                let e = bandSeamErr(band: band, nf: nf, rEnd: r)
+                if e < bestErr { bestErr = e; bestR = r }
+                r += 1
+            }
+        }
+        // 锐利最小值判据：真对齐 = 尖锐全局最小（bestErr ≪ 平均）；伪锚点（新帧不含带，
+        // 平滑渐变上随便哪都半像）误差曲线平缓，bestErr ≈ 平均 → 拒绝
+        let meanErr = errN > 0 ? errSum / Double(errN) : .greatestFiniteMagnitude
+        let dbg = ProcessInfo.processInfo.environment["SM_DEBUG"] == "1"
+        if dbg {
+            let l = "[ShotMark] relocate: bestR=" + String(bestR) + " bestErr=" + String(format: "%.2f", bestErr)
+                + " meanErr=" + String(format: "%.2f", meanErr)
+                + " bandTop=" + String(capturedBottom - B) + " cB=" + String(capturedBottom)
+            fputs(l + "\n", stderr)
+        }
+        guard bestR > 0, bestErr < 150, bestErr < 0.5 * meanErr else { return nil }
+        return capturedBottom - bestR
+    }
+
+    /// 长图底部 B 行的带（行级字节拷贝自 segments，零坐标系歧义）。返回 (带Frame, 带顶abs位置)。
+    private func bottomBandFrame(_ B: Int) -> (Frame, Int)? {
+        let bandTop = capturedBottom - B
+        guard bandTop >= capturedTop, let first = segments.first else { return nil }
+        let w = first.1.width
+        let bpr = w * 4
+        var data = [UInt8](repeating: 235, count: bpr * B)
+        for (pos, cg) in segments {
+            let seg = Frame(cg)
+            let lo = max(pos, bandTop)
+            let hi = min(pos + seg.h, capturedBottom)
+            guard hi > lo else { continue }
+            let srcStart = (lo - pos) * seg.bpr
+            let len = (hi - lo) * seg.bpr
+            let piece = seg.data.subdata(in: srcStart..<srcStart+len)
+            let dstStart = (lo - bandTop) * bpr
+            data.replaceSubrange(dstStart..<dstStart+len, with: piece)
+        }
+        return frameFromRows(data, w: w, h: B).map { ($0, bandTop) }
+    }
+
+    /// 从 top-origin 行数据组装 Frame（缓冲快照，零坐标系歧义）
+    private func frameFromRows(_ data: [UInt8], w: Int, h: Int) -> Frame? {
+        var d = data
+        let bpr = w * 4
+        var cgOut: CGImage?
+        d.withUnsafeMutableBytes { ptr in
+            guard let base = ptr.baseAddress,
+                  let ctx = CGContext(data: base, width: w, height: h,
+                                      bitsPerComponent: 8, bytesPerRow: bpr,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            cgOut = ctx.makeImage()
+        }
+        guard let cg = cgOut else { return nil }
+        return Frame(cg)
+    }
+
+    /// 带底部 L 行 vs 新帧 [rEnd-L, rEnd) 的墨迹加权误差
+    private func bandSeamErr(band: Frame, nf: Frame, rEnd: Int) -> Double {
+        let L = min(band.h, rEnd)
+        guard L >= 40 else { return .greatestFiniteMagnitude }
+        // stripErrorInk 比较 prev[dy+r] vs new[r]：配对 band[band.h-L+t] ↔ nf[rEnd-L+t] → dy = band.h - rEnd
+        return Self.stripErrorInk(prev: band, new: nf, dy: band.h - rEnd, rowLo: rEnd - L, rowHi: rEnd - 1)
+    }
+
+    private var nfWidth: Int { segments.first?.1.width ?? 0 }
+
+    /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
 
 
     /// 跳帧恢复的接缝验证：新帧与长图重叠部分，必须和长图底部实际内容一致。

@@ -47,6 +47,7 @@ enum SelfTest {
 
         // 3) 滚动拼接离线自检
         testScrollStitch(outDir: outDir)
+        testSkipRecover(outDir: outDir)
         testWhitePageMatching(outDir: outDir)
         testReanchor()
         testDimLayer(captured: captured, sel: sel, outDir: outDir)
@@ -174,6 +175,70 @@ enum SelfTest {
         let visible = diffs > 50
         print("textpipe: 提交=\(committed) 差异像素=\(diffs) 区域=(\(minX),\(minY))-(\(maxX),\(maxY)) 可见=\(visible) -> \(committed && visible ? "PASS" : "FAIL")")
         Render.writePNG(withText, to: outDir.appendingPathComponent("textpipe.png"))
+    }
+
+    /// 跳帧恢复自检（滚轮惯性断缝事故）：正常滚 3 帧后跳帧（lastFrame 过期），
+    /// 新帧与旧参照无重叠——relocate 必须对长图底部带找回真实位置，而不是拼出断缝。
+    private static func testSkipRecover(outDir: URL) {
+        let W = 400, SRCH = 1600, FH = 400
+        guard let srcRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: SRCH,
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                            isPlanar: false, colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0, bitsPerPixel: 0),
+              let sctx = NSGraphicsContext(bitmapImageRep: srcRep) else { print("skiprec: init FAIL"); return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = sctx
+        NSGradient(colors: [NSColor(srgbRed: 0.2, green: 0.3, blue: 0.5, alpha: 1),
+                            NSColor(srgbRed: 0.6, green: 0.3, blue: 0.2, alpha: 1)])!
+            .draw(in: NSRect(x: 0, y: 0, width: W, height: SRCH), angle: -90)
+        let numAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 20, weight: .bold),
+            .foregroundColor: NSColor.white,
+        ]
+        for y in stride(from: 10, to: SRCH - 30, by: 40) {
+            NSString(string: "row \(y)").draw(at: CGPoint(x: 20, y: CGFloat(y)), withAttributes: numAttrs)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let srcCG = srcRep.cgImage else { print("skiprec: src FAIL"); return }
+
+        func frameAt(_ off: Int) -> ScrollCaptureSession.Frame? {
+            srcCG.cropping(to: CGRect(x: 0, y: off, width: W, height: FH)).map { ScrollCaptureSession.Frame($0) }
+        }
+
+        var result: NSImage?
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { img in
+            result = img
+        }
+        // 正常滚：0 → 120 → 240（每帧 120，匹配无压力）
+        for off in [0, 120, 240] {
+            guard let f = frameAt(off) else { print("skiprec: frame FAIL"); return }
+            session.process(newFrame: f)
+        }
+        // 跳帧：用户惯性一甩到 900——与长图无重叠，relocate 正确拒绝（内容未捕获，丢 [640,900]）
+        // 回滚到 500：与长图底部重叠 → relocate 找回 o=500 续接到 900
+        // 再 700：正常续接到 1100
+        guard let jump = frameAt(900) else { print("skiprec: jump FAIL"); return }
+        session.process(newFrame: jump)
+        guard let back = frameAt(500) else { print("skiprec: back FAIL"); return }
+        session.process(newFrame: back)
+        guard let cont = frameAt(700) else { print("skiprec: cont FAIL"); return }
+        session.process(newFrame: cont)
+        session.finish()
+        guard let composed = result,
+              let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            print("skiprec: compose FAIL"); return
+        }
+        // 期望：跳帧丢 [640,900]，回滚续接后覆盖源图 [0, 700+FH) 共 1100 行
+        let expectH = 700 + FH
+        guard let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: expectH)) else {
+            print("skiprec: ref FAIL"); return
+        }
+        let f = ScrollCaptureSession.Frame(composedCG)
+        let r = ScrollCaptureSession.Frame(refCG)
+        let err = ScrollCaptureSession.stripError(prev: f, new: r, dy: 0)
+        let pass = composedCG.height == expectH && err < 3.0
+        print("skiprec: 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(pass ? "PASS" : "FAIL")")
     }
 
     /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。
