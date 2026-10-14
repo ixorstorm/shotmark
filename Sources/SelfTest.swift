@@ -215,22 +215,17 @@ enum SelfTest {
             guard let f = frameAt(off) else { print("skiprec: frame FAIL"); return }
             session.process(newFrame: f)
         }
-        // 跳帧：用户惯性一甩到 900——与长图无重叠，relocate 正确拒绝（内容未捕获，丢 [640,900]）
-        // 回滚到 500：与长图底部重叠 → relocate 找回 o=500 续接到 900
-        // 再 700：正常续接到 1100
+        // 跳帧：用户惯性一甩到 900——与长图无重叠，追踪丢失 → 截断收尾（ShareX 红停语义）
+        // 长图保留已捕获的 [0,640]，用户从断点重新开始即可
         guard let jump = frameAt(900) else { print("skiprec: jump FAIL"); return }
         session.process(newFrame: jump)
-        guard let back = frameAt(500) else { print("skiprec: back FAIL"); return }
-        session.process(newFrame: back)
-        guard let cont = frameAt(700) else { print("skiprec: cont FAIL"); return }
-        session.process(newFrame: cont)
         session.finish()
         guard let composed = result,
               let composedCG = composed.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             print("skiprec: compose FAIL"); return
         }
-        // 期望：跳帧丢 [640,900]，回滚续接后覆盖源图 [0, 700+FH) 共 1100 行
-        let expectH = 700 + FH
+        // 期望：截断语义，长图保留已捕获的 [0,640]
+        let expectH = 640
         guard let refCG = srcCG.cropping(to: CGRect(x: 0, y: 0, width: W, height: expectH)) else {
             print("skiprec: ref FAIL"); return
         }

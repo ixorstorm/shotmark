@@ -72,6 +72,7 @@ final class ScrollCaptureSession: NSObject {
     private var capturing = false
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var nilStreak = 0                  // 连续配不上且内容在变的拍数（失速预警）
+    private var broken = false                 // 追踪丢失已收尾（截断模式）
 
     private var firstFrame: Frame?
     private var lastFrame: Frame?
@@ -239,313 +240,9 @@ final class ScrollCaptureSession: NSObject {
         }
     }
 
-    private func tick() {
-        guard !capturing else { return }
-        capturing = true
-        let screen = self.screen
-        let region = self.regionPts
-        Task { @MainActor in
-            defer { capturing = false }
-            do {
-                let cg = try await Capture.grabRegion(screen: screen, regionPts: region)
-                process(newFrame: Frame(cg))
-            } catch {
-                // 单帧失败忽略，下一拍重试
-            }
-        }
-    }
-
-    /// 帧处理（internal 便于离线自检直接驱动）
-    func process(newFrame nf: Frame) {
-        guard !tornDown else { return }
-        guard firstFrame != nil else {
-            firstFrame = nf
-            lastFrame = nf
-            pointScale = CGFloat(nf.w) / regionPts.width
-            segments = [(0, nf.cg)]
-            capturedBottom = nf.h
-            capturedTop = 0
-            lastPos = 0
-            updatePreview(force: true)      // 第一帧即出预览
-            return
-        }
-        guard let prev = lastFrame else { return }
-        let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
-        debugDys.append(detail.dy)
-        if ProcessInfo.processInfo.environment["SM_DEBUG"] == "1" {
-            let dyStr = detail.dy.map { String($0) } ?? "nil"
-            let errStr = String(format: "%.2f", detail.fineErr)
-            let l = "SM tick: nilStreak=" + String(nilStreak) + " lastPos=" + String(lastPos)
-                + " cB=" + String(capturedBottom) + " dy=" + dyStr + " err=" + errStr
-            fputs(l + "\n", stderr)
-        }
-        guard let dy = detail.dy else {
-            // 未匹配（滚轮惯性甩快/低纹理）。恢复顺序：
-            // ① 长图底部带重定位（惯性快滚后新帧通常仍与长图底部有重叠）
-            // ② 全图重锚定（用户回滚到已拼区域上部的情况）
-            // ③ 都失败：保留最新帧作下拍参照（内容在动，旧参照只会更远），计失速等用户回滚
-            if let o = relocateAgainstBottomBand(nf: nf) {
-                let ap = applyMatch(dy: o - lastPos, nf: nf)
-                nilStreak = 0
-                borderView?.warning = nil
-                let line = "[ShotMark] relocated(nil-path): o=" + String(o) + " append=" + String(ap)
-                fputs(line + "\n", stderr)
-                return
-            }
-            if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
-                lastFrame = slice
-                lastPos = pos
-                let ap = applyMatch(dy: dy2, nf: nf)
-                nilStreak = 0
-                borderView?.warning = nil
-                debugLog(detail: d2, appended: ap)
-                return
-            }
-            let staticErr = Self.stripError(prev: prev, new: nf, dy: 0)
-            if nilStreak >= 3 {
-                // 连续 3 拍锚不上 = 内容确实跳变了（甩太快/页面跳转）。
-                // 接受不连续：整帧拼在长图尾部（有可见跳变但内容不丢），重置锚定继续
-                let ap = applyMatch(dy: capturedBottom - lastPos, nf: nf)
-                nilStreak = 0
-                borderView?.warning = "检测到画面跳变，长图此处不连续"
-                let line = "[ShotMark] discontinuity accepted: append=" + String(ap)
-                fputs(line + "\n", stderr)
-                debugLog(detail: detail, appended: ap)
-                return
-            }
-            nilStreak = staticErr > 8 ? min(nilStreak + 1, 50) : 0
-            lastFrame = nf   // 保留最新帧：内容在动，旧参照只会更远（nilStreak>0 标记位置未知）
-            borderView?.warning = nilStreak >= 5
-                ? "衔接丢失 · 回滚到已拼过的画面即可自动续接"
-                : nil
-            debugLog(detail: detail, appended: 0)
-            return
-        }
-        // 跳帧恢复（滚轮惯性场景实测断缝根因）：期间有过 dy=nil，lastFrame 已过期——
-        // 对过期参照匹配出的 dy 不可信，必须先对「长图底部带」重定位拿绝对位置；
-        // 候选新增若与长图邻域对齐 = 已拼内容的重复（来回滚歧义定位），只校准账本不拼
-        var vdy = dy
-        if nilStreak > 0 {
-            // 跳帧后 lastFrame 已过期，对它的匹配不可信——改对「长图底部带」重定位：
-            // 在新帧里找长图底边的真实落点，直接得到绝对位置（不依赖 accCache/节流）
-            if let o = relocateAgainstBottomBand(nf: nf) {
-                let newBelow = (o + nf.h) - capturedBottom
-                let newAbove = capturedTop - o
-                if newBelow > 40 {
-                    if duplicateNearBottom(nf: nf, o: o) {
-                        // 已拼内容的重复：不拼，只把账本校准到真实位置
-                        lastFrame = nf
-                        lastPos = o
-                        nilStreak = 0
-                        borderView?.warning = nil
-                        let line = "[ShotMark] dup-bottom: o=" + String(o) + " 跳过重复拼接"
-                        fputs(line + "\n", stderr)
-                        return
-                    }
-                    vdy = o - lastPos
-                    let line = "[ShotMark] relocated: o=" + String(o) + " vdy=" + String(vdy)
-                    fputs(line + "\n", stderr)
-                } else if newAbove > 40 {
-                    if duplicateNearTop(nf: nf, o: o) {
-                        lastFrame = nf
-                        lastPos = o
-                        nilStreak = 0
-                        let line = "[ShotMark] dup-top: o=" + String(o) + " 跳过重复前插"
-                        fputs(line + "\n", stderr)
-                        return
-                    }
-                    vdy = o - lastPos
-                } else {
-                    // 纯重游（整帧在已拼区域内）：只校准账本
-                    lastFrame = nf
-                    lastPos = o
-                    nilStreak = 0
-                    return
-                }
-            } else {
-                // 新帧与长图无重叠（甩太远）或找不到锚点：诚实放弃这一帧
-                nilStreak = min(nilStreak + 1, 50)
-                debugLog(detail: detail, appended: 0)
-                return
-            }
-        }
-        let appended = applyMatch(dy: vdy, nf: nf)
-        debugLog(detail: detail, appended: appended)
-    }
-
-    /// 从 segments 组装长图的 [absTop, absTop+height) 行段（行级拷贝，零坐标系歧义）
-    private func compositeRows(_ absTop: Int, _ height: Int) -> Frame? {
-        let absBottom = absTop + height
-        guard absTop >= capturedTop, absBottom <= capturedBottom, let first = segments.first else { return nil }
-        let w = first.1.width
-        let bpr = w * 4
-        var data = [UInt8](repeating: 235, count: bpr * height)
-        for (pos, cg) in segments {
-            let seg = Frame(cg)
-            let lo = max(pos, absTop)
-            let hi = min(pos + seg.h, absBottom)
-            guard hi > lo else { continue }
-            let srcStart = (lo - pos) * seg.bpr
-            let len = (hi - lo) * seg.bpr
-            let piece = seg.data.subdata(in: srcStart..<srcStart+len)
-            let dstStart = (lo - absTop) * bpr
-            data.replaceSubrange(dstStart..<dstStart+len, with: piece)
-        }
-        return frameFromRows(data, w: w, h: height)
-    }
-
-    private func bottomBandFrame(_ B: Int) -> (Frame, Int)? {
-        guard capturedBottom - capturedTop >= B else { return nil }
-        let top = capturedBottom - B
-        return compositeRows(top, B).map { ($0, top) }
-    }
-
-    /// 重复检测：候选新增头部若能与长图尾部邻域（capturedBottom - 2H … capturedBottom）任一偏移对齐，
-    /// 则为已拼内容的重复（均匀列表来回滚的歧义定位所致），不拼。
-    private func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
-        let headTop = capturedBottom
-        let len = min(220, o + nf.h - headTop)
-        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: headTop - o, width: nf.w, height: len)) else { return false }
-        let cand = Frame(candCG)
-        let searchTop = max(capturedTop, capturedBottom - 2 * nf.h)
-        guard let ref = compositeRows(searchTop, capturedBottom - searchTop) else { return false }
-        var best = Double.greatestFiniteMagnitude
-        var off = 0
-        let maxOff = ref.h - len
-        while off <= maxOff {
-            let e = Self.stripErrorInk(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
-            if e < best { best = e }
-            off += 8
-        }
-        let line = "[ShotMark] dupBottom check: best=" + String(format: "%.2f", best)
-        fputs(line + "\n", stderr)
-        return best < 60
-    }
-
-    /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复
-    private func duplicateNearTop(nf: Frame, o: Int) -> Bool {
-        let len = min(220, capturedTop - o)
-        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
-        let cand = Frame(candCG)
-        let searchH = min(capturedBottom - capturedTop, 2 * nf.h)
-        guard let ref = compositeRows(capturedTop, searchH) else { return false }
-        var best = Double.greatestFiniteMagnitude
-        var off = 0
-        let maxOff = ref.h - len
-        while off <= maxOff {
-            let e = Self.stripErrorInk(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
-            if e < best { best = e }
-            off += 8
-        }
-        return best < 60
-    }
-
-    /// 跳帧恢复：把长图底部带（末 B 行）在新帧里重定位，返回新帧顶部的绝对位置 o。
-    /// 找不到（无重叠/歧义）返回 nil。带从 segments 现场绘制，不依赖 accCache/节流。
-    private func relocateAgainstBottomBand(nf: Frame) -> Int? {
-        let B = min(300, max(120, capturedBottom - capturedTop))
-        let dbg2 = ProcessInfo.processInfo.environment["SM_DEBUG"] == "1"
-        if dbg2 {
-            let l = "[ShotMark] relocate enter: B=" + String(B) + " nf=" + String(nf.w) + "x" + String(nf.h)
-                + " cT=" + String(capturedTop) + " cB=" + String(capturedBottom)
-                + " segs=" + String(segments.count)
-            fputs(l + "\n", stderr)
-        }
-        guard capturedBottom - capturedTop >= B + 60,
-              let (band, bandTop) = bottomBandFrame(B) else { return nil }
-        // 带底边在新帧内的落点 rEnd ∈ [60, nf.h]；对应帧顶 abs 位置 o = capturedBottom - rEnd
-        var bestR = -1
-        var bestErr = Double.greatestFiniteMagnitude
-        var errSum = 0.0
-        var errN = 0
-        // rEnd ∈ [60, nf.h-60]：新帧与长图至少 60px 真实重叠（防跳帧大间隙的伪锚点）
-        var rEnd = 60
-        let rEndMax = max(60, nf.h - 60)
-        while rEnd <= rEndMax {
-            let e = bandSeamErr(band: band, nf: nf, rEnd: rEnd)
-            if e < bestErr { bestErr = e; bestR = rEnd }
-            errSum += e; errN += 1
-            rEnd += 2      // 恢复路径用细步长：真对齐可能落在任意行（步长 8 会跳过，实测 rEnd=140 漏检）
-        }
-        // 精扫 ±8
-        if bestR > 0 {
-            var r = max(60, bestR - 8)
-            let hi = min(nf.h - 60, bestR + 8)
-            while r <= hi {
-                let e = bandSeamErr(band: band, nf: nf, rEnd: r)
-                if e < bestErr { bestErr = e; bestR = r }
-                r += 1
-            }
-        }
-        // 锐利最小值判据：真对齐 = 尖锐全局最小（bestErr ≪ 平均）；伪锚点（新帧不含带，
-        // 平滑渐变上随便哪都半像）误差曲线平缓，bestErr ≈ 平均 → 拒绝
-        let meanErr = errN > 0 ? errSum / Double(errN) : .greatestFiniteMagnitude
-        let dbg = ProcessInfo.processInfo.environment["SM_DEBUG"] == "1"
-        if dbg {
-            let l = "[ShotMark] relocate: bestR=" + String(bestR) + " bestErr=" + String(format: "%.2f", bestErr)
-                + " meanErr=" + String(format: "%.2f", meanErr)
-                + " bandTop=" + String(capturedBottom - B) + " cB=" + String(capturedBottom)
-            fputs(l + "\n", stderr)
-        }
-        guard bestR > 0, bestErr < 150, bestErr < 0.5 * meanErr else { return nil }
-        return capturedBottom - bestR
-    }
-
-
-    /// 从 top-origin 行数据组装 Frame（缓冲快照，零坐标系歧义）
-    private func frameFromRows(_ data: [UInt8], w: Int, h: Int) -> Frame? {
-        var d = data
-        let bpr = w * 4
-        var cgOut: CGImage?
-        d.withUnsafeMutableBytes { ptr in
-            guard let base = ptr.baseAddress,
-                  let ctx = CGContext(data: base, width: w, height: h,
-                                      bitsPerComponent: 8, bytesPerRow: bpr,
-                                      space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
-            cgOut = ctx.makeImage()
-        }
-        guard let cg = cgOut else { return nil }
-        return Frame(cg)
-    }
-
-    /// 带底部 L 行 vs 新帧 [rEnd-L, rEnd) 的墨迹加权误差
-    private func bandSeamErr(band: Frame, nf: Frame, rEnd: Int) -> Double {
-        let L = min(band.h, rEnd)
-        guard L >= 40 else { return .greatestFiniteMagnitude }
-        // stripErrorInk 比较 prev[dy+r] vs new[r]：配对 band[band.h-L+t] ↔ nf[rEnd-L+t] → dy = band.h - rEnd
-        return Self.stripErrorInk(prev: band, new: nf, dy: band.h - rEnd, rowLo: rEnd - L, rowHi: rEnd - 1)
-    }
-
-    private var nfWidth: Int { segments.first?.1.width ?? 0 }
+    private var SMDebugOn: Bool { ProcessInfo.processInfo.environment["SM_DEBUG"] == "1" }
 
     /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
-
-
-    /// 跳帧恢复的接缝验证：新帧与长图重叠部分，必须和长图底部实际内容一致。
-    /// 通过 → 返回原 dy；不符/无法验证且风险高 → nil（调用方强制重锚定）。
-    private func verifySeam(nf: Frame, dy: Int) -> Int? {
-        guard let acc = accCache, acc.top == capturedTop, acc.bottom == capturedBottom else { return dy }
-        let pAbs = lastPos + dy
-        guard pAbs + nf.h > capturedBottom else { return dy }   // 整帧都在已拼区域内（重游）：无接缝
-        var L = min(300, nf.h, capturedBottom - pAbs)
-        guard L >= 60 else { return nil }                        // 与长图重叠不足：证据不够，须重锚定
-        var nfLo = capturedBottom - pAbs - L
-        if nfLo < 0 { L += nfLo; nfLo = 0 }
-        guard L >= 60,
-              let bandCG = acc.cg.cropping(to: CGRect(x: 0, y: acc.cg.height - L, width: nf.w, height: L)),
-              let nfCG = nf.cg.cropping(to: CGRect(x: 0, y: nfLo, width: nf.w, height: L)) else { return nil }
-        let band = Frame(bandCG)
-        let nfPart = Frame(nfCG)
-        let seamErr = Self.stripError(prev: band, new: nfPart, dy: 0)
-        let line = "[ShotMark] seam verify: L=" + String(L) + " err=" + String(format: "%.2f", seamErr)
-            + (seamErr <= 3.0 ? " pass" : " FAIL -> reanchor")
-        fputs(line + "\n", stderr)
-        return seamErr <= 3.0 ? dy : nil
-    }
-
-    /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
-    @discardableResult
     private func applyMatch(dy: Int, nf: Frame) -> Int {
         nilStreak = 0
         borderView?.warning = nil
@@ -585,6 +282,75 @@ final class ScrollCaptureSession: NSObject {
         lastFrame = nf
         return appended
     }
+
+    private func tick() {
+        guard !capturing else { return }
+        capturing = true
+        let screen = self.screen
+        let region = self.regionPts
+        Task { @MainActor in
+            defer { capturing = false }
+            do {
+                let cg = try await Capture.grabRegion(screen: screen, regionPts: region)
+                process(newFrame: Frame(cg))
+            } catch {
+                // 单帧失败忽略，下一拍重试
+            }
+        }
+    }
+
+    /// 帧处理（internal 便于离线自检直接驱动）
+    /// 语义（ShareX 红停模式）：小位移可靠追踪；追踪丢失 = 立即收尾出图 + 提示从断点重来。
+    /// 不做任何启发式放置——均匀列表上的歧义定位会产生重复/错位（实测多轮教训）。
+    func process(newFrame nf: Frame) {
+        guard !tornDown else { return }
+        guard firstFrame != nil else {
+            firstFrame = nf
+            lastFrame = nf
+            pointScale = CGFloat(nf.w) / regionPts.width
+            segments = [(0, nf.cg)]
+            capturedBottom = nf.h
+            capturedTop = 0
+            lastPos = 0
+            updatePreview(force: true)      // 第一帧即出预览
+            return
+        }
+        guard let prev = lastFrame else { return }
+        let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
+        debugDys.append(detail.dy)
+        if SMDebugOn {
+            let dyStr = detail.dy.map { String($0) } ?? "nil"
+            let errStr = String(format: "%.2f", detail.fineErr)
+            fputs("SM tick: nilStreak=" + String(nilStreak) + " lastPos=" + String(lastPos)
+                + " cB=" + String(capturedBottom) + " dy=" + dyStr + " err=" + errStr + "\n", stderr)
+        }
+        if let dy = detail.dy {
+            let appended = applyMatch(dy: dy, nf: nf)
+            debugLog(detail: detail, appended: appended)
+            return
+        }
+        // 匹配失败：重锚定一次（回滚续接）；再失败 → 截断收尾（绝不启发式放置）
+        if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
+            lastFrame = slice
+            lastPos = pos              // ⚠️ 必须先切到 slice 的坐标基准，dy2 才是相对它的
+            let appended = applyMatch(dy: dy2, nf: nf)
+            nilStreak = 0
+            debugLog(detail: d2, appended: appended)
+            return
+        }
+        if !broken {
+            broken = true
+            borderView?.warning = "滚动过快，长图已在此截断"
+            let line = "[ShotMark] tracking lost -> finish partial"
+            fputs(line + "\n", stderr)
+            Task { @MainActor in
+                NotificationCenter.default.post(name: Notification.Name("SMTrackingLost"), object: nil)
+                self.finish()
+            }
+        }
+        debugLog(detail: detail, appended: 0)
+    }
+
 
     // MARK: - 拼接
 
