@@ -329,7 +329,32 @@ final class ScrollCaptureSession: NSObject {
             debugLog(detail: detail, appended: appended)
             return
         }
-        // 匹配失败：重锚定一次（回滚续接）；再失败 → 截断收尾（绝不启发式放置）
+        // 匹配失败分级处理：
+        // ① tex=0（重叠区全白/纯色，无配准信息）→ 视为未滚动空过，不截断（空白区长度已在上帧范围内）
+        // ② 重锚定一次（回滚续接）
+        // ③ 连续 3 拍仍失败 → 截断收尾（绝不启发式放置——均匀列表歧义会复制/错位，实测教训）
+        // 空白帧检测：整帧墨迹占比 < 5%（纯白/纯色区域）→ 空过不截断（长图范围已含）。
+        // ⚠️ 不能用 detail.tex==0 判断——闸门拒绝的匹配 tex 也是 0，会误伤重锚定
+        var ink = 0, tot = 0
+        nf.data.withUnsafeBytes { raw in
+            let p = raw.bindMemory(to: UInt8.self)
+            var r = 0
+            while r < nf.h {
+                var c = 0
+                while c < nf.w {
+                    let i = r * nf.bpr + c * 4
+                    if (Int(p[i]) + Int(p[i+1]) + Int(p[i+2])) / 3 < 210 { ink += 1 }
+                    tot += 1
+                    c += 24
+                }
+                r += 24
+            }
+        }
+        let blank = tot > 0 && ink * 20 < tot
+        if blank {
+            debugLog(detail: detail, appended: 0)
+            return
+        }
         if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
             lastFrame = slice
             lastPos = pos              // ⚠️ 必须先切到 slice 的坐标基准，dy2 才是相对它的
@@ -338,10 +363,11 @@ final class ScrollCaptureSession: NSObject {
             debugLog(detail: d2, appended: appended)
             return
         }
-        if !broken {
+        nilStreak = min(nilStreak + 1, 50)
+        if nilStreak >= 3 {
             broken = true
             borderView?.warning = "滚动过快，长图已在此截断"
-            let line = "[ShotMark] tracking lost -> finish partial"
+            let line = "[ShotMark] tracking lost -> finish partial (nilStreak=" + String(nilStreak) + ")"
             fputs(line + "\n", stderr)
             Task { @MainActor in
                 NotificationCenter.default.post(name: Notification.Name("SMTrackingLost"), object: nil)
