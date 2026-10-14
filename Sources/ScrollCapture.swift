@@ -440,11 +440,18 @@ final class ScrollCaptureSession: NSObject {
             ScrollDeltaDetail(dy: -$0, fineErr: bwdRaw.fineErr, secondErr: bwdRaw.secondErr, tex: bwdRaw.tex)
         } ?? bwdRaw
         if fwd.dy != nil, bwd.dy != nil {
-            // 两向都有效时取重叠大者（=位移更小、证据更多）——噪声帧上反向幻影 err 更低是常态，
-            // 用 err 竞争会被噪声带偏（实测：真正向 dy=87 err0.2 输过反向幻影 dy=-210 err0.18）
+            // 重叠大者优先（位移更小、证据更多；噪声帧上幻影 err 更低是常态，纯 err 竞争会被带偏），
+            // 但另一向 err 显著更低（< 0.5×）时以 err 为准——均匀列表正反都能「对上」，
+            // 重叠大的可能是错周期/错位置（stitch 第三缝 fwd76 挤掉真 -84 事故）
             let fwdOv = prev.h - abs(fwd.dy ?? 0)
             let bwdOv = prev.h - abs(bwd.dy ?? 0)
-            return fwdOv >= bwdOv ? fwd : bwd
+            let fe = fwd.fineErr ?? .greatestFiniteMagnitude
+            let be = bwd.fineErr ?? .greatestFiniteMagnitude
+            if fwdOv >= bwdOv {
+                return be < 0.5 * fe ? bwd : fwd
+            } else {
+                return fe < 0.5 * be ? fwd : bwd
+            }
         }
         return fwd.dy != nil ? fwd : bwd
     }
@@ -488,16 +495,35 @@ final class ScrollCaptureSession: NSObject {
         // 闸门⑤：三带一致性。重叠区分三带各自验误差，任一带 err > max(3.0, fineErr*3) 即拒绝。
         // 均匀列表（卡片等高）会让错误周期在全局均值上低误差命中——独特内容（地标行）的
         // 高误差被白底稀释（成员列表页尾部拼错事故：dy 偏半张卡，全局 err 仅 1.24/1.51）
+        // 闸门⑤：三带独立最优判定（均匀列表防错周期）。
+        // 重叠区分三带，各带在全域（跳出全局 dy ±8）用墨迹误差找自己的最优 dy；
+        // 某带的全局最优显著优于它在全局 dy 处的误差（< 0.5×）= 该带与全局 dy 不一致 → 拒绝。
+        // 与「带间 max/min 比值」规则的区别：墨迹分布不均的页面（文字密集带 vs 空白带）
+        // 不会误伤——对齐的带在别处不会更优。成员列表页尾部拼错事故的最终修复。
         let overlap = H - fine
         if overlap >= 120 {
             let bandH = overlap / 3
-            var maxBandErr = 0.0
             for b in 0..<3 {
-                let lo = b * bandH
-                let hi = (b == 2) ? overlap - 1 : (b + 1) * bandH - 1
-                maxBandErr = max(maxBandErr, stripErrorRange(prev: prev, new: new, dy: fine, rowLo: lo, rowHi: hi))
+                let lo = fine + b * bandH
+                let hi = (b == 2) ? overlap - 1 : (fine + (b + 1) * bandH - 1)
+                let eAtFine = stripErrorInk(prev: prev, new: new, dy: fine, rowLo: lo, rowHi: hi)
+                guard eAtFine > 30 else { continue }   // 这带已近乎全等，无需检查
+                // 该带在双向全域找自己的最优 dy（负 dy 时 prev 行号 d+r 需在界内，按交集裁剪）
+                var best = eAtFine
+                var d = -maxDelta
+                while d <= maxDelta {
+                    if abs(d - fine) > 8 {
+                        let lo2 = max(lo, -d)
+                        let hi2 = min(hi, H - 1 - d)
+                        if hi2 - lo2 >= 20 {
+                            let e = stripErrorInk(prev: prev, new: new, dy: d, rowLo: lo2, rowHi: hi2)
+                            if e < best { best = e }
+                        }
+                    }
+                    d += 8
+                }
+                if best < 0.5 * eAtFine && best < 150 { return none }
             }
-            if maxBandErr > max(3.0, fineErr * 3) { return none }
         }
 
         // 闸门②：贴边界的候选必须是近乎全等
@@ -507,7 +533,7 @@ final class ScrollCaptureSession: NSObject {
         // 闸门③④：恒要求显著优于次优解（白底页 err 地形平坦，「几乎全等」豁免会让幻影钻进来——
         // 实测幻影 dy=312 err1.74 second2.91 恰好靠豁免过线；真匹配的 secondErr 都很大）
         let decisive = fineErr < 0.6 * secondErr
-        let dyOut: Int? = (fineErr < 5.0 && decisive && tex >= 48) ? fine : nil
+        let dyOut: Int? = (fineErr < 150 && decisive && tex >= 48) ? fine : nil
         return ScrollDeltaDetail(dy: dyOut, fineErr: fineErr, secondErr: secondErr, tex: tex)
     }
 
@@ -575,34 +601,48 @@ final class ScrollCaptureSession: NSObject {
         return n > 0 ? sum / n : .greatestFiniteMagnitude
     }
 
-    static func stripError(prev: Frame, new: Frame, dy: Int) -> Double {
-        let overlap = prev.h - dy
-        guard overlap > 40 else { return .greatestFiniteMagnitude }
-        let rowStep = max(2, overlap / 64)
+    /// 墨迹加权误差：只统计「至少一侧有墨迹」（亮度 < 210）的采样对。
+    /// 白底配白底不携带配准信息——不剔除的话均匀列表上错位文字的代价被白底稀释（拼错事故根因）。
+    /// 墨迹样本不足时退回普通均值。
+    static func stripErrorInk(prev: Frame, new: Frame, dy: Int, rowLo: Int, rowHi: Int) -> Double {
+        let rows = rowHi - rowLo + 1
+        guard rows >= 8 else { return .greatestFiniteMagnitude }
+        let rowStep = max(1, rows / 32)
         let colStep = max(4, prev.w / 96)
-        var sum = 0.0, n = 0.0
+        var inkSum = 0.0, inkN = 0.0
         prev.data.withUnsafeBytes { pBuf in
             new.data.withUnsafeBytes { nBuf in
                 let p = pBuf.bindMemory(to: UInt8.self)
                 let q = nBuf.bindMemory(to: UInt8.self)
-                var r = 0
-                while r < overlap {
+                var r = rowLo
+                while r <= rowHi {
                     let pr = (dy + r) * prev.bpr
                     let nr = r * new.bpr
                     var c = 0
                     while c < prev.w {
                         let i = pr + c * 4, j = nr + c * 4
-                        sum += Double(abs(Int(p[i]) - Int(q[j]))
-                                      + abs(Int(p[i + 1]) - Int(q[j + 1]))
-                                      + abs(Int(p[i + 2]) - Int(q[j + 2])))
-                        n += 3
+                        let pLum = (Int(p[i]) + Int(p[i+1]) + Int(p[i+2])) / 3
+                        let qLum = (Int(q[i]) + Int(q[i+1]) + Int(q[i+2])) / 3
+                        if min(pLum, qLum) < 210 {
+                            inkSum += Double(abs(Int(p[i]) - Int(q[j]))
+                                            + abs(Int(p[i + 1]) - Int(q[j + 1]))
+                                            + abs(Int(p[i + 2]) - Int(q[j + 2])))
+                            inkN += 3
+                        }
                         c += colStep
                     }
                     r += rowStep
                 }
             }
         }
-        return n > 0 ? sum / n : .greatestFiniteMagnitude
+        if inkN >= 60 { return inkSum / inkN }
+        return stripErrorRange(prev: prev, new: new, dy: dy, rowLo: rowLo, rowHi: rowHi)
+    }
+
+    static func stripError(prev: Frame, new: Frame, dy: Int) -> Double {
+        let overlap = prev.h - dy
+        guard overlap > 40 else { return .greatestFiniteMagnitude }
+        return stripErrorRange(prev: prev, new: new, dy: dy, rowLo: 0, rowHi: overlap - 1)
     }
 
 
