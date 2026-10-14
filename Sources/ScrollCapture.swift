@@ -539,6 +539,33 @@ final class ScrollCaptureSession: NSObject {
                 + " cB=" + String(capturedBottom) + " dy=" + dyStr + " err=" + errStr + "\n", stderr)
         }
         if let dy = detail.dy {
+            // 幻影预检（实测事故：lastPos 漂移到 cB 前面 950px 后，一次灌入 1820px 错位内容）：
+            // 匹配声称的帧顶超出长图底 - 40 = 无重叠证据的匹配，不可信 → 直接走重定位恢复
+            if lastPos + dy > capturedBottom - 40 {
+                if let o = relocateAgainstBottomBand(nf: nf) ?? relocateAgainstTopBand(nf: nf) {
+                    let newBelow = (o + nf.h) - capturedBottom
+                    let dup = newBelow > 40 ? duplicateNearBottom(nf: nf, o: o)
+                            : (capturedTop - o > 40 ? duplicateNearTop(nf: nf, o: o) : false)
+                    if !dup {
+                        let ap = applyMatch(dy: o - lastPos, nf: nf)
+                        nilStreak = 0
+                        borderView?.warning = nil
+                        let line = "[ShotMark] precheck-recovered: o=" + String(o) + " append=" + String(ap)
+                        fputs(line + "\n", stderr)
+                        return
+                    }
+                    lastFrame = nf
+                    lastPos = o
+                    nilStreak = 0
+                    return
+                }
+                // 重定位失败：lastPos 钳到长图底（帧顶不可能在长图之外），本帧放弃
+                lastFrame = nf
+                lastPos = capturedBottom
+                nilStreak = min(nilStreak + 1, 50)
+                debugLog(detail: detail, appended: 0)
+                return
+            }
             // 停靠带检测（当前默认关闭）：行级相等判据在独立渲染的 AA 抖动下不稳定
             // （文字行抖动 ≈30 且随 tick 波动），误激活会导致重建基准后丢内容。
             // 已知限制：含固定顶栏的页面会长图重复顶栏（内容完整无损）；规避 = 框选避开顶栏。
