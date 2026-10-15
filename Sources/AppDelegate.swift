@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pinnedWindows: [NSWindow] = []
     private var statusItem: NSStatusItem?
     private var scrollSession: ScrollCaptureSession?
+    var autoScrollDriver: AutoScrollDriver?
     private var toastWin: NSWindow?
     private var toastImage: NSImage?
 
@@ -298,14 +299,27 @@ extension AppDelegate: ShotViewDelegate {
         let session = ScrollCaptureSession(screen: screen, regionPts: selection, snapshot: view.captured) { [weak self] img in
             guard let self = self else { return }
             self.scrollSession = nil
+            self.autoScrollDriver?.stop()
+            self.autoScrollDriver = nil
             guard let img = img else { return }   // 取消
             self.copyToPasteboard(img)
             let rep = img.representations.first
-            // 不自动存盘（用户 2026-10-09：时间久了一大堆垃圾）——toast 上给「保存」按钮自选
-            self.showToast("滚动截屏完成：已复制到剪贴板（\(rep?.pixelsWide ?? 0)×\(rep?.pixelsHigh ?? 0)px）", saveImage: img)
+            self.showToast("长截图完成：已复制到剪贴板（\(rep?.pixelsWide ?? 0)×\(rep?.pixelsHigh ?? 0)px）", saveImage: img)
         }
         scrollSession = session
-        session.start()
+        // 自动滚动模式（飞书同款）：辅助功能已授权 → 工具自己发小步长滚轮 + 抓帧拼接；
+        // 未授权 → 引导授权一次，本次回退手动滚动
+        if Accessibility.trusted(prompt: false) {
+            session.start()
+            let driver = AutoScrollDriver(session: session, screen: screen, region: selection)
+            autoScrollDriver = driver
+            driver.start()
+            showToast("自动滚动长截图中 · 到底自动完成 · Esc 停止")
+        } else {
+            _ = Accessibility.trusted(prompt: true)   // 弹系统授权引导
+            session.start()                           // 本次回退手动滚动
+            showToast("已回退手动滚动 · 授权辅助功能后下次自动滚动")
+        }
     }
 
     private func showToast(_ text: String, saveImage img: NSImage? = nil) {
