@@ -331,19 +331,22 @@ enum SelfTest {
             let cg = cgFull.cropping(to: CGRect(x: 0, y: TALL - topFromBottom, width: W, height: H))!
             return ScrollCaptureSession.Frame(cg)
         }
-        // 真位移 100：prev 顶=1082，new 顶=982（帧底分别 400 / 300）
-        let prev = frameAt(1082)
-        let new = frameAt(982)
-        let detail = ScrollCaptureSession.scrollDeltaDetailed(prev: prev, new: new)
+        // 会话级：喂 f(1082) 再喂 f(982)（真位移 100），断言只正确追加 100 行（错周期会被拒）
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: H)) { _ in }
+        session.loggingEnabled = false
+        session.process(newFrame: frameAt(1082))
+        let before = session.debugCapturedBottom
+        session.process(newFrame: frameAt(982))
+        let appended = session.debugCapturedBottom - before
         // 地标黑条在 prev 内：abs 行 980-1010 → prev 顶=1082 → prev 帧 y-up 行 [72,102]
         // 帧内行(顶部起算) = H - yUpBottom - h = 682-102-30=550..580（中带）
         // 若匹配到错误周期（dy=100±208），地标落在某条带里必然高误差 → 必须拒绝
         // 真位移 dy=100：地标对齐 → 放行
-        let dy = detail.dy ?? -9999
-        let ok = dy == 100
-        let errStr = String(format: "%.2f", detail.fineErr)
+        let ok = appended == 100
+        let errStr = "append=\(appended)"
         let verdict = ok ? "PASS" : "FAIL"
-        print("uniformlist: dy=\(dy) err=\(errStr) -> \(verdict)（期望 100）")
+        print("uniformlist: \(errStr) -> \(verdict)（期望 100）")
     }
 
     /// 文字识别自检：画带字的图，Vision 必须找回关键字（离线，秒级）
@@ -617,23 +620,34 @@ enum SelfTest {
             ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!)
         }
         // 上滚（内容下移）：应识别为反向 -87（真匹配，不是幻影）；幻影的防法在「全白对齐被纹理闸门过滤」
-        let up = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(258), new: frame(171))
-        let p1 = up.dy == -87
-        let _wm0 = p1
-        print("whitematch: 上滚 dy=\(up.dy.map(String.init) ?? "nil") tex=\(up.tex) -> \(_wm0 ? "PASS" : "FAIL")")
-        if !_wm0 { fail("whitematch") }
+        func freshSession() -> ScrollCaptureSession {
+            let ss = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                          regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+            ss.loggingEnabled = false
+            return ss
+        }
+        let sess = freshSession()
+        sess.process(newFrame: frame(258))
+        sess.process(newFrame: frame(171))
+        let upOK = sess.debugCapturedTop <= 258 - 87 && sess.debugCapturedBottom <= 258 + FH
+        if !upOK { fail("whitematch") }
+        print("whitematch: 上滚 cT=\(sess.debugCapturedTop) -> \(upOK ? "PASS" : "FAIL")")
         // 正常下滚：稀疏文本提供足够纹理，仍应正确匹配
-        let down = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(87))
-        let p2 = down.dy == 87
+        let downSess = freshSession()
+        downSess.process(newFrame: frame(0))
+        downSess.process(newFrame: frame(87))
+        let p2 = downSess.debugCapturedBottom == 487
         let _wm1 = p2
-        print("whitematch: 下滚 dy=\(down.dy.map(String.init) ?? "nil") tex=\(down.tex) -> \(_wm1 ? "PASS" : "FAIL")")
+        print("whitematch: 下滚 cB=\(downSess.debugCapturedBottom) 期望 487 -> \(_wm1 ? "PASS" : "FAIL")")
         if !_wm1 { fail("whitematch") }
         // 幻影回归（真实事故 2026-10-09：dy=660 顶满边界、err 5.95 擦边过线 → 660 行错位追加）：
         // 大跳变两帧零重叠，精确匹配必须 nil（旧模糊匹配会瞎猜）
-        let phantom = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: frame(1100))
-        let p3 = phantom.dy == nil
+        let phantomSess = freshSession()
+        phantomSess.process(newFrame: frame(0))
+        phantomSess.process(newFrame: frame(1100))
+        let p3 = phantomSess.debugCapturedBottom == 400
         let _wm2 = p3
-        print("whitematch: 大跳变零重叠 dy=\(phantom.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",phantom.fineErr)) tex=\(phantom.tex) -> \(_wm2 ? "PASS" : "FAIL")")
+        print("whitematch: 大跳变零重叠 不增长 -> \(_wm2 ? "PASS" : "FAIL")")
         if !_wm2 { fail("whitematch") }
         // 噪声回归（SCK 分数像素 sourceRect 重采样/光标闪烁）：帧内撒 ±8 噪声点，仍应匹配 dy=87
         guard let noisyRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: FH,
@@ -653,10 +667,12 @@ enum SelfTest {
         }
         NSGraphicsContext.restoreGraphicsState()
         let noisy = ScrollCaptureSession.Frame(noisyRep.cgImage!)
-        let noisyMatch = ScrollCaptureSession.scrollDeltaDetailed(prev: frame(0), new: noisy)
-        let p4 = noisyMatch.dy == 87
+        let noiseSess = freshSession()
+        noiseSess.process(newFrame: frame(0))
+        noiseSess.process(newFrame: noisy)
+        let p4 = noiseSess.debugCapturedBottom == 487
         let _wm3 = p4
-        print("whitematch: 噪声帧 dy=\(noisyMatch.dy.map(String.init) ?? "nil") err=\(String(format:"%.2f",noisyMatch.fineErr)) tex=\(noisyMatch.tex) -> \(_wm3 ? "PASS" : "FAIL")")
+        print("whitematch: 噪声帧 cB=\(noiseSess.debugCapturedBottom) 期望 487 -> \(_wm3 ? "PASS" : "FAIL")")
         if !_wm3 { fail("whitematch") }
     }
 
