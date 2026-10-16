@@ -357,9 +357,24 @@ final class ScrollCaptureSession: NSObject {
 
     /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
     private func applyMatch(dy: Int, nf: Frame) -> Int {
+        let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
+        // 所有路径统一图比图闸门：候选位置与长图对应区必须近乎全等才允许拼接。
+        // 覆盖普通匹配、预检恢复、幻影恢复、重锚定——任何错锚都在这里被拒绝。
+        let lo = max(capturedTop, p)
+        let hi = min(capturedBottom, p + nf.h)
+        if hi - lo >= 60,
+           let ref = compositeRows(lo, hi - lo),
+           let nfPart = nf.cg.cropping(to: CGRect(x: 0, y: lo - p, width: nf.w, height: hi - lo)) {
+            let e = Self.stripError(prev: ref, new: Frame(nfPart), dy: 0)
+            if e > 3.0 {
+                diag("apply_rejected", ["p": String(p), "seamErr": String(format: "%.2f", e)])
+                diagnostics?.saveAnomaly(nf.cg, tag: "apply-reject")
+                diagnostics?.saveAnomaly(ref.cg, tag: "apply-ref")
+                return 0
+            }
+        }
         nilStreak = 0
         borderView?.warning = nil
-        let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
         var appended = 0
         if dy >= 0 {
             // 底部追加超出水位线的部分；跳过帧顶停靠行（固定 UI 不重复拼入）
