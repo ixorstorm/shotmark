@@ -134,6 +134,7 @@ final class ScrollCaptureSession: NSObject {
         Capture.invalidateContentCache()
         hotKeyRefs = HotKey.registerRaw(keys: [49, 36, 53]) { [weak self] code in
             guard let self = self else { return }
+            self.diag("hotkey", ["code": String(code)])
             if code == 53 { self.cancel() } else { self.finish() }
         }
         scheduleTimer(0.15)
