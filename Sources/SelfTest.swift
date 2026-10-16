@@ -99,6 +99,7 @@ enum SelfTest {
         record("prependChain", testPrependChain())
         record("mixedChain", testMixedChain())
         record("fastRetry", testFastRetry())
+        record("fullDownUp", testFullDownUp())
 
         print("SELFTEST SUMMARY: \(failures.count) failed / \(results.count) total")
         if !failures.isEmpty {
@@ -320,6 +321,28 @@ enum SelfTest {
         session.finish()
         guard let img = result, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
         return cg.height == 1100
+    }
+
+    /// 双向完整覆盖：下滚继续拼 + 回滚到页面顶部也前插，不只保一头
+    private static func testFullDownUp() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        var result: NSImage?
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { img in result = img }
+        session.loggingEnabled = false
+        // 从 src 240 开始：下滚到 360 继续拼，再回滚到 120 和 0（顶部前插 src 120..240）
+        for off in [240, 360, 240, 120, 0] {
+            session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
+        }
+        session.finish()
+        guard let img = result, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+        // 预期：下滚 + 回滚共覆盖 src [0, 760) 共 760 行，cT=-240，cB=520
+        guard let ref = src.cropping(to: CGRect(x: 0, y: 0, width: W, height: 760)) else { return false }
+        let err = ScrollCaptureSession.stripError(prev: ScrollCaptureSession.Frame(cg), new: ScrollCaptureSession.Frame(ref), dy: 0)
+        let ok = cg.height == 760 && session.debugCapturedTop == -240 && session.debugCapturedBottom == 520 && err < 3.0
+        print("fullDownUp: h=\(cg.height) cT=\(session.debugCapturedTop) cB=\(session.debugCapturedBottom) err=\(String(format: "%.2f", err)) -> \(ok ? "PASS" : "FAIL")")
+        return ok
     }
 
     /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。
