@@ -101,6 +101,7 @@ enum SelfTest {
         record("fastRetry", testFastRetry())
         record("fullDownUp", testFullDownUp())
         record("staticPauseNoAutoFinish", testStaticPauseNoAutoFinish())
+        record("upReanchorRecovery", testUpReanchorRecovery())
 
         print("SELFTEST SUMMARY: \(failures.count) failed / \(results.count) total")
         if !failures.isEmpty {
@@ -370,6 +371,33 @@ enum SelfTest {
         session.finish()
         guard let img = result, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
         return cg.height == 574
+    }
+
+    /// 上滚回已拼位置：普通匹配全拒时，绝对校验重锚定找回并继续下滚
+    private static func testUpReanchorRecovery() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        var result: NSImage?
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { img in result = img }
+        session.loggingEnabled = false
+        for off in [0, 300, 600, 900] {
+            session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
+        }
+        // 上滚到 src 200（相对上一帧 -700，超出量程）：应绝对校验重锚定 lastPos=200
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 200, width: W, height: FH))!))
+        guard session.debugLastPos == 200 else { return false }
+        // 继续下滚到 1000：应恢复继续拼到 1400（无重复）
+        for off in [400, 700, 1000] {
+            session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
+        }
+        session.finish()
+        guard let img = result, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+        guard let ref = src.cropping(to: CGRect(x: 0, y: 0, width: W, height: 1400)) else { return false }
+        let err = ScrollCaptureSession.stripError(prev: ScrollCaptureSession.Frame(cg), new: ScrollCaptureSession.Frame(ref), dy: 0)
+        let ok = cg.height == 1400 && err < 3.0
+        print("upReanchorRecovery: lastPos=\(session.debugLastPos) h=\(cg.height) err=\(String(format: "%.2f", err)) -> \(ok ? "PASS" : "FAIL")")
+        return ok
     }
 
     /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。

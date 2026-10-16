@@ -197,14 +197,32 @@ final class ScrollCaptureSession: NSObject {
         }
         guard bestOff >= 0, bestErr < 8.0 else { return nil }
 
-        // 全分辨率验证：裁长图对应切片，走既有的五闸门匹配器
+        // 全分辨率验证：裁长图对应切片，先走既有的五闸门匹配器
         let pos = capturedTop + bestOff * 4
         let sliceTop = min(max(capturedTop, pos - 32), capturedBottom - nf.h)
         guard let sliceCG = acc.cg.cropping(to: CGRect(x: 0, y: sliceTop - capturedTop, width: nf.w, height: nf.h)) else { return nil }
         let sliceFrame = Frame(sliceCG)
         let detail = Self.scrollDeltaDetailed(prev: sliceFrame, new: nf)
-        guard detail.dy != nil else { return nil }
-        return (sliceFrame, sliceTop, detail)
+        if detail.dy != nil { return (sliceFrame, sliceTop, detail) }
+
+        // 五闸门全拒时走绝对位置精细校验（uniform list 上 fineErr≈secondErr 会误伤真匹配）：
+        // 粗搜位置 ±32 内逐像素滑窗，取绝对误差最小者；只有近乎全等（<3.0）才认锚，
+        // 不再依赖 fineErr < 0.6×secondErr 的显著性判据。
+        var bestAbs = Int.min
+        var bestFine = Double.greatestFiniteMagnitude
+        for d in -32...32 {
+            let top = pos + d
+            guard top >= capturedTop, top + nf.h <= capturedBottom else { continue }
+            guard let cg = acc.cg.cropping(to: CGRect(x: 0, y: top - capturedTop, width: nf.w, height: nf.h)) else { continue }
+            let sf = Frame(cg)
+            let e = Self.stripError(prev: sf, new: nf, dy: 0)
+            if e < bestFine { bestFine = e; bestAbs = d }
+        }
+        guard bestAbs != Int.min, bestFine < 3.0 else { return nil }
+        let finalTop = pos + bestAbs
+        guard let finalCG = acc.cg.cropping(to: CGRect(x: 0, y: finalTop - capturedTop, width: nf.w, height: nf.h)) else { return nil }
+        let finalDetail = ScrollDeltaDetail(dy: 0, fineErr: bestFine, secondErr: bestFine, tex: 0)
+        return (Frame(finalCG), finalTop, finalDetail)
     }
 
     /// 小尺度偏置误差：acc 的 [off, off+nf.h) vs nf 的 [0, nf.h)
