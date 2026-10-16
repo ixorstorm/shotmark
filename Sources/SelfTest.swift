@@ -100,6 +100,7 @@ enum SelfTest {
         record("mixedChain", testMixedChain())
         record("fastRetry", testFastRetry())
         record("fullDownUp", testFullDownUp())
+        record("staticPauseNoAutoFinish", testStaticPauseNoAutoFinish())
 
         print("SELFTEST SUMMARY: \(failures.count) failed / \(results.count) total")
         if !failures.isEmpty {
@@ -343,6 +344,32 @@ enum SelfTest {
         let ok = cg.height == 760 && session.debugCapturedTop == -240 && session.debugCapturedBottom == 520 && err < 3.0
         print("fullDownUp: h=\(cg.height) cT=\(session.debugCapturedTop) cB=\(session.debugCapturedBottom) err=\(String(format: "%.2f", err)) -> \(ok ? "PASS" : "FAIL")")
         return ok
+    }
+
+    /// 中途停顿不得自动完成（用户事故：刚滚一点停下就被当页尾收尾）
+    private static func testStaticPauseNoAutoFinish() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        var finishedEarly = false
+        var result: NSImage?
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { img in
+            result = img
+            finishedEarly = true
+        }
+        session.loggingEnabled = false
+        for off in [0, 87, 174] {
+            session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
+        }
+        // 连续 20 拍同帧（模拟用户中途停顿 >1.8s）：不得自动完成
+        let still = ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 174, width: W, height: FH))!)
+        for _ in 0..<20 { session.process(newFrame: still) }
+        if finishedEarly { return false }
+        if session.debugCapturedBottom != 574 { return false }
+        // 用户显式完成才收尾，且高度不增长
+        session.finish()
+        guard let img = result, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+        return cg.height == 574
     }
 
     /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。

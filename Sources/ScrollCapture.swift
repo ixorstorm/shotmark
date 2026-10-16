@@ -580,15 +580,12 @@ final class ScrollCaptureSession: NSObject {
         if let dy = detail.dy {
             let prevPos = lastPos
             let appended = applyMatch(dy: dy, nf: nf)
-            // 页尾自动完成：画面完全静止（dy=0 且零追加）连续 12 拍 ≈ 1.8s
+            // 静止提示，不自动完成：中途停顿与真正页尾无法区分，禁止误判收尾
+            // （用户事故：刚滚一点停下就被当成页尾自动完成）。没新内容本就不追加。
             if dy == 0, appended == 0 {
-                staticTicks += 1
-                if staticTicks >= 12 {
-                    borderView?.warning = "已到页面末尾，自动完成"
-                    fputs("[ShotMark] page end -> auto finish\n", stderr)
-                    NotificationCenter.default.post(name: Notification.Name("SMTrackingLost"), object: nil)
-                    finish()
-                    return
+                staticTicks = min(staticTicks + 1, 60)
+                if staticTicks == 12 {
+                    borderView?.warning = "画面已静止 · 回车/空格完成 · Esc 取消"
                 }
             } else {
                 staticTicks = 0
