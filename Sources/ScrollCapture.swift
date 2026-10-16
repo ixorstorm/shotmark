@@ -377,22 +377,6 @@ final class ScrollCaptureSession: NSObject {
         nilStreak = 0
         borderView?.warning = nil
         var appended = 0
-        // 重复段拦截：新追加内容若在长图尾部邻域近乎全等，说明已拼过，只校准不追加
-        if dy >= 0 {
-            let newBelow = (p + nf.h) - capturedBottom
-            if newBelow > 40, duplicateNearBottom(nf: nf, o: p) {
-                lastPos = p
-                diag("dup_bottom_skip", ["o": String(p)])
-                return 0
-            }
-        } else {
-            let newAbove = capturedTop - p
-            if newAbove > 40, duplicateNearTop(nf: nf, o: p) {
-                lastPos = p
-                diag("dup_top_skip", ["o": String(p)])
-                return 0
-            }
-        }
         if dy >= 0 {
             // 底部追加超出水位线的部分；跳过帧顶停靠行（固定 UI 不重复拼入）
             let start = max(capturedBottom - p, stickyH)
@@ -482,23 +466,44 @@ final class ScrollCaptureSession: NSObject {
 
     /// 重复检测：候选新增头部若能与长图尾部邻域（capturedBottom - 2H … capturedBottom）任一偏移对齐，
     /// 则为已拼内容的重复（均匀列表来回滚的歧义定位所致），不拼。
+    /// 用 NSBitmapImageRep.colorAt 安全读像素，不碰裸数据指针（实测重复检测裸读会 EXC_BAD_ACCESS）。
     func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
         let headTop = capturedBottom
         let len = min(220, o + nf.h - headTop)
-        // 防越界崩溃：o 超出长图底部或 len 超帧高时，CGImage.cropping 会 EXC_BAD_ACCESS
         let y = max(0, headTop - o)
         let safeLen = min(len, nf.h - y)
-        guard safeLen >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: safeLen)) else { return false }
-        let cand = Frame(candCG)
+        guard safeLen >= 60,
+              let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: safeLen)) else { return false }
+        let candRep = NSBitmapImageRep(cgImage: candCG)
         let searchTop = max(capturedTop, capturedBottom - 2 * nf.h)
         guard let ref = compositeRows(searchTop, capturedBottom - searchTop) else { return false }
+        let refRep = NSBitmapImageRep(cgImage: ref.cg)
         var best = Double.greatestFiniteMagnitude
         var bestOff = -1
         var off = 0
         let maxOff = ref.h - safeLen
         while off <= maxOff {
-            let e = Self.stripError(prev: ref, new: cand, dy: off)
-            if e < best { best = e; bestOff = off }
+            var sum = 0.0, n = 0.0
+            var yy = 0
+            while yy < safeLen {
+                let ry = yy + off
+                if ry < refRep.pixelsHigh {
+                    var xx = 8
+                    while xx + 8 < nf.w {
+                        if let a = refRep.colorAt(x: xx, y: ry), let b = candRep.colorAt(x: xx, y: yy) {
+                            // NSColor 分量是 0-1，转成 0-255 与 stripError 同尺度（阈值 3.0 = 每通道平均 1）
+                            sum += Double(abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)) * 255
+                            n += 3
+                        }
+                        xx += 32
+                    }
+                }
+                yy += 8
+            }
+            if n > 0 {
+                let e = sum / n
+                if e < best { best = e; bestOff = off }
+            }
             off += 8
         }
         let line = "[ShotMark] dupBottom check: seamErr=" + String(format: "%.2f", best) + " at composite row " + String(searchTop + bestOff)
