@@ -98,6 +98,7 @@ enum SelfTest {
         record("darkModeInk", testDarkModeInk())
         record("prependChain", testPrependChain())
         record("mixedChain", testMixedChain())
+        record("fastRetry", testFastRetry())
 
         print("SELFTEST SUMMARY: \(failures.count) failed / \(results.count) total")
         if !failures.isEmpty {
@@ -292,6 +293,33 @@ enum SelfTest {
         let _ok_skiprec = pass
         print("skiprec: 期望高度=\(expectH) 实际=\(composedCG.height) 误差=\(String(format: "%.2f", err)) -> \(_ok_skiprec ? "PASS" : "FAIL")")
         if !_ok_skiprec { fail("skiprec") }
+    }
+
+    /// 滚太快失配 → 只丢弃不重拼，用户回滚到已拼区域后恢复继续（不得提前截断）
+    private static func testFastRetry() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        var finishedEarly = false
+        var result: NSImage?
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { img in
+            result = img
+            finishedEarly = true
+        }
+        session.loggingEnabled = false
+        for off in [0, 120, 240] {
+            session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: off, width: W, height: FH))!))
+        }
+        // 惯性甩到 900：无重叠，必须只丢弃，不得提前截断收尾
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 900, width: W, height: FH))!))
+        if finishedEarly { return false }
+        if session.debugCapturedBottom != 640 { return false }
+        // 用户回滚到 500：已拼区域附近，应恢复续接；再 700 续到 1100
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 500, width: W, height: FH))!))
+        session.process(newFrame: ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 700, width: W, height: FH))!))
+        session.finish()
+        guard let img = result, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+        return cg.height == 1100
     }
 
     /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。

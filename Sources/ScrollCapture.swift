@@ -569,10 +569,9 @@ final class ScrollCaptureSession: NSObject {
                 nilStreak = 0
                 return
             }
-            // 重定位失败：帧顶不可能在长图之外，账本钳到长图底，本帧放弃
-            lastFrame = nf
-            lastPos = capturedBottom
+            // 重定位失败：本帧丢弃，位置账本不动；提示用户回滚到已拼画面重试
             nilStreak = min(nilStreak + 1, 50)
+            borderView?.warning = "滚动过快 · 请回滚到已拼过的画面重试"
             debugLog(detail: detail, appended: 0)
             return
         }
@@ -665,14 +664,11 @@ final class ScrollCaptureSession: NSObject {
             debugLog(detail: d2, appended: appended)
             return
         }
+        // 匹配失败：本帧丢弃，位置账本不动；连续失败只提示回滚，不截断会话
         nilStreak = min(nilStreak + 1, 50)
-        if nilStreak >= 3 {
-            broken = true
-            borderView?.warning = "滚动过快，长图已在此截断"
-            fputs("[ShotMark] tracking lost -> finish partial (nilStreak=\(nilStreak))\n", stderr)
-            NotificationCenter.default.post(name: Notification.Name("SMTrackingLost"), object: nil)
-            finish()
-            return
+        if nilStreak >= 2 {
+            borderView?.warning = "滚动过快 · 请回滚到已拼过的画面重试"
+            fputs("[ShotMark] frame skipped (unmatchable, retry by scrolling back)\n", stderr)
         }
         debugLog(detail: detail, appended: 0)
     }
