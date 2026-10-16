@@ -430,8 +430,11 @@ enum SelfTest {
         // 顶部方向同样验证：完全在长图上方且内容重复 → 判重复；独有内容不误判
         let dupTop = session.duplicateNearTop(nf: ScrollCaptureSession.Frame(a), o: -400)
         let uniqueTop = session.duplicateNearTop(nf: ScrollCaptureSession.Frame(b), o: -400)
-        let ok = dup && !unique && dupTop && !uniqueTop
-        print("duplicateDetection: bottom repeated=\(dup) unique=\(unique) top repeated=\(dupTop) unique=\(uniqueTop) -> \(ok ? "PASS" : "FAIL")")
+        // 全局查重（内容变化/错位分流）：已拼过的 A 能找回位置，独有的 B 找不到
+        let foundA = session.findDuplicatePosition(cand: ScrollCaptureSession.Frame(a))
+        let foundB = session.findDuplicatePosition(cand: ScrollCaptureSession.Frame(b))
+        let ok = dup && !unique && dupTop && !uniqueTop && foundA != nil && foundB == nil
+        print("duplicateDetection: bottom repeated=\(dup) unique=\(unique) top repeated=\(dupTop) unique=\(uniqueTop) globalA=\(foundA != nil) globalB=\(foundB != nil) -> \(ok ? "PASS" : "FAIL")")
         return ok
     }
 

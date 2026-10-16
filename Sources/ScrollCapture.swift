@@ -517,6 +517,26 @@ final class ScrollCaptureSession: NSObject {
         return best < 3.0
     }
 
+    /// 全局查重：把候选内容（>40px 的新段）在整幅长图里按行搜索。
+    /// 找到近乎全等的位置 = 已拼过，返回该位置的绝对行；找不到 = 内容变了/新内容，允许继续拼。
+    func findDuplicatePosition(cand: Frame) -> Int? {
+        guard cand.h >= 60 else { return nil }
+        guard let ref = compositeRows(capturedTop, capturedBottom - capturedTop) else { return nil }
+        var best = Double.greatestFiniteMagnitude
+        var bestOff = -1
+        var off = 0
+        let maxOff = ref.h - cand.h
+        while off <= maxOff {
+            if let sub = ref.cg.cropping(to: CGRect(x: 0, y: off, width: ref.w, height: cand.h)) {
+                let e = Self.stripError(prev: Frame(sub), new: cand, dy: 0)
+                if e < best { best = e; bestOff = off }
+            }
+            off += 8
+        }
+        guard bestOff >= 0, best < 3.0 else { return nil }
+        return capturedTop + bestOff
+    }
+
     /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复。
     /// 用 NSBitmapImageRep.colorAt 安全读像素，不碰裸数据指针（实测裸读会 EXC_BAD_ACCESS）。
     func duplicateNearTop(nf: Frame, o: Int) -> Bool {
@@ -704,15 +724,36 @@ final class ScrollCaptureSession: NSObject {
                let nfPart = nf.cg.cropping(to: CGRect(x: 0, y: lo - p, width: nf.w, height: hi - lo)) {
                 let e = Self.stripError(prev: ref, new: Frame(nfPart), dy: 0)
                 if e > 3.0 {
-                    lastPos = prevPos
-                    lastFrame = prev
-                    nilStreak = max(nilStreak, 1)
-                    borderView?.warning = "位置不符 · 已丢弃本帧，请回滚重试"
-                    diag("splice_rejected", ["p": String(p), "seamErr": String(format: "%.2f", e)])
-                    diagnostics?.saveAnomaly(nf.cg, tag: "splice-reject")
-                    diagnostics?.saveAnomaly(ref.cg, tag: "splice-ref")
-                    fputs("[ShotMark] splice rejected: p=\(p) seamErr=\(String(format: "%.2f", e))\n", stderr)
-                    return
+                    // 接缝不匹配不一定是错位，也可能是内容变了（头像/消息渲染更新）。
+                    // 先把候选新段放到整幅长图里全局查重：找到=已拼过（校准不拼），找不到=内容变了（允许继续拼）。
+                    if dy < 0 {
+                        let newAbove = capturedTop - p
+                        if newAbove > 40 {
+                            let take = min(220, newAbove, nf.h)
+                            if take >= 60,
+                               let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: take)),
+                               let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
+                                lastPos = dupOff
+                                diag("dup_top_skip", ["off": String(dupOff)])
+                                return
+                            }
+                        }
+                    } else {
+                        let newBelow = (p + nf.h) - capturedBottom
+                        if newBelow > 40 {
+                            let take = min(220, newBelow)
+                            let y = capturedBottom - p
+                            if take >= 60, y >= 0, y + take <= nf.h,
+                               let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: take)),
+                               let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
+                                lastPos = dupOff
+                                diag("dup_bottom_skip", ["off": String(dupOff)])
+                                return
+                            }
+                        }
+                    }
+                    diag("content_changed_accept", ["p": String(p), "seamErr": String(format: "%.2f", e)])
+                    fputs("[ShotMark] seam mismatch but no duplicate found -> accept (content changed): p=\(p) seamErr=\(String(format: "%.2f", e))\n", stderr)
                 }
             }
             let appended = applyMatch(dy: dy, nf: nf)
