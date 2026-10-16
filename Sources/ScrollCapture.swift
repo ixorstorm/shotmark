@@ -465,44 +465,44 @@ final class ScrollCaptureSession: NSObject {
 
     /// 重复检测：候选新增头部若能与长图尾部邻域（capturedBottom - 2H … capturedBottom）任一偏移对齐，
     /// 则为已拼内容的重复（均匀列表来回滚的歧义定位所致），不拼。
-    private func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
+    func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
         let headTop = capturedBottom
         let len = min(220, o + nf.h - headTop)
         guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: headTop - o, width: nf.w, height: len)) else { return false }
         let cand = Frame(candCG)
         let searchTop = max(capturedTop, capturedBottom - 2 * nf.h)
         guard let ref = compositeRows(searchTop, capturedBottom - searchTop) else { return false }
-        var best = 1.0
+        var best = Double.greatestFiniteMagnitude
         var bestOff = -1
         var off = 0
         let maxOff = ref.h - len
         while off <= maxOff {
-            let e = Self.mismatchRatio(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            let e = Self.stripError(prev: ref, new: cand, dy: off)
             if e < best { best = e; bestOff = off }
             off += 8
         }
-        let line = "[ShotMark] dupBottom check: mismatch=" + String(format: "%.2f", best) + " at composite row " + String(searchTop + bestOff)
+        let line = "[ShotMark] dupBottom check: seamErr=" + String(format: "%.2f", best) + " at composite row " + String(searchTop + bestOff)
         fputs(line + "\n", stderr)
-        return best < 0.15
+        return best < 3.0
     }
 
     /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复
-    private func duplicateNearTop(nf: Frame, o: Int) -> Bool {
+    func duplicateNearTop(nf: Frame, o: Int) -> Bool {
         let len = min(220, capturedTop - o)
         guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
         let cand = Frame(candCG)
         let searchH = min(capturedBottom - capturedTop, 2 * nf.h)
         guard let ref = compositeRows(capturedTop, searchH) else { return false }
-        var best = 1.0
+        var best = Double.greatestFiniteMagnitude
         var bestOff = -1
         var off = 0
         let maxOff = ref.h - len
         while off <= maxOff {
-            let e = Self.mismatchRatio(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            let e = Self.stripError(prev: ref, new: cand, dy: off)
             if e < best { best = e; bestOff = off }
             off += 8
         }
-        return best < 0.15
+        return best < 3.0
     }
 
     /// 下滚甩出恢复：长图底部带 vs 新帧头部对齐，返回帧顶绝对位置 o（锐利最小值判据）。

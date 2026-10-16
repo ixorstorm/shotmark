@@ -102,6 +102,7 @@ enum SelfTest {
         record("fullDownUp", testFullDownUp())
         record("staticPauseNoAutoFinish", testStaticPauseNoAutoFinish())
         record("upReanchorRecovery", testUpReanchorRecovery())
+        record("duplicateDetection", testDuplicateDetection())
 
         print("SELFTEST SUMMARY: \(failures.count) failed / \(results.count) total")
         if !failures.isEmpty {
@@ -397,6 +398,36 @@ enum SelfTest {
         let err = ScrollCaptureSession.stripError(prev: ScrollCaptureSession.Frame(cg), new: ScrollCaptureSession.Frame(ref), dy: 0)
         let ok = cg.height == 1400 && err < 3.0
         print("upReanchorRecovery: lastPos=\(session.debugLastPos) h=\(cg.height) err=\(String(format: "%.2f", err)) -> \(ok ? "PASS" : "FAIL")")
+        return ok
+    }
+
+    /// 重复段检测回归：相同内容被判为已拼过，独有内容不被误判（用于防重叠拼接）
+    private static func testDuplicateDetection() -> Bool {
+        let W = 400, FH = 400
+        func makeBlock(_ label: String, _ color: NSColor) -> CGImage {
+            let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: FH,
+                                       bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                       isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            color.setFill()
+            NSRect(x: 0, y: 0, width: W, height: FH).fill()
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.boldSystemFont(ofSize: 20), .foregroundColor: NSColor.white]
+            NSString(string: label).draw(at: CGPoint(x: 24, y: 200), withAttributes: attrs)
+            NSGraphicsContext.restoreGraphicsState()
+            return rep.cgImage!
+        }
+        let a = makeBlock("BLOCK-A", NSColor(srgbRed: 0.2, green: 0.3, blue: 0.5, alpha: 1))
+        let b = makeBlock("BLOCK-B-UNIQUE", NSColor(srgbRed: 0.6, green: 0.2, blue: 0.3, alpha: 1))
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        // 首帧 = A（cB=400）。候选新增头 = A 的第二次出现 → 应判重复；独有 B → 不判重复
+        session.process(newFrame: ScrollCaptureSession.Frame(a))
+        let dup = session.duplicateNearBottom(nf: ScrollCaptureSession.Frame(a), o: 400)
+        let unique = session.duplicateNearBottom(nf: ScrollCaptureSession.Frame(b), o: 400)
+        let ok = dup && !unique
+        print("duplicateDetection: repeated=\(dup) unique=\(unique) -> \(ok ? "PASS" : "FAIL")")
         return ok
     }
 
