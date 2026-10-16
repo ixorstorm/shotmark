@@ -485,14 +485,17 @@ final class ScrollCaptureSession: NSObject {
     func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
         let headTop = capturedBottom
         let len = min(220, o + nf.h - headTop)
-        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: headTop - o, width: nf.w, height: len)) else { return false }
+        // 防越界崩溃：o 超出长图底部或 len 超帧高时，CGImage.cropping 会 EXC_BAD_ACCESS
+        let y = max(0, headTop - o)
+        let safeLen = min(len, nf.h - y)
+        guard safeLen >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: safeLen)) else { return false }
         let cand = Frame(candCG)
         let searchTop = max(capturedTop, capturedBottom - 2 * nf.h)
         guard let ref = compositeRows(searchTop, capturedBottom - searchTop) else { return false }
         var best = Double.greatestFiniteMagnitude
         var bestOff = -1
         var off = 0
-        let maxOff = ref.h - len
+        let maxOff = ref.h - safeLen
         while off <= maxOff {
             let e = Self.stripError(prev: ref, new: cand, dy: off)
             if e < best { best = e; bestOff = off }
@@ -505,7 +508,7 @@ final class ScrollCaptureSession: NSObject {
 
     /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复
     func duplicateNearTop(nf: Frame, o: Int) -> Bool {
-        let len = min(220, capturedTop - o)
+        let len = min(220, capturedTop - o, nf.h)
         guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
         let cand = Frame(candCG)
         let searchH = min(capturedBottom - capturedTop, 2 * nf.h)

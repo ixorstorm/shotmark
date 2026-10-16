@@ -103,6 +103,7 @@ enum SelfTest {
         record("staticPauseNoAutoFinish", testStaticPauseNoAutoFinish())
         record("upReanchorRecovery", testUpReanchorRecovery())
         record("duplicateDetection", testDuplicateDetection())
+        record("duplicateOutOfBounds", testDuplicateOutOfBounds())
 
         print("SELFTEST SUMMARY: \(failures.count) failed / \(results.count) total")
         if !failures.isEmpty {
@@ -429,6 +430,22 @@ enum SelfTest {
         let ok = dup && !unique
         print("duplicateDetection: repeated=\(dup) unique=\(unique) -> \(ok ? "PASS" : "FAIL")")
         return ok
+    }
+
+    /// duplicateNearBottom 越界回归：o 超出长图底/负坐标均不得崩溃（真实崩溃 EXC_BAD_ACCESS）
+    private static func testDuplicateOutOfBounds() -> Bool {
+        let W = 400, FH = 400
+        let src = gradientSource(W: W, h: 1600)
+        let session = ScrollCaptureSession(screen: NSScreen.main ?? NSScreen.screens[0],
+                                           regionPts: CGRect(x: 0, y: 0, width: W, height: FH)) { _ in }
+        session.loggingEnabled = false
+        let f = ScrollCaptureSession.Frame(src.cropping(to: CGRect(x: 0, y: 0, width: W, height: FH))!)
+        session.process(newFrame: f)
+        _ = session.duplicateNearBottom(nf: f, o: 800)     // headTop-o 为负
+        _ = session.duplicateNearBottom(nf: f, o: 500)     // y+len 可能越界
+        _ = session.duplicateNearBottom(nf: f, o: -200)    // 负 o
+        print("duplicateOutOfBounds: no crash -> PASS")
+        return true
     }
 
     /// 均匀列表闸门自检（用户事故 2026-10-12：成员列表页尾部拼错）。
