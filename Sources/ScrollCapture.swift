@@ -597,6 +597,24 @@ final class ScrollCaptureSession: NSObject {
         // ② 常规匹配（小位移，最精确可靠）
         if let dy = detail.dy {
             let prevPos = lastPos
+            // 双向拼接前图比图：候选位置与长图对应区必须近乎全等（直接像素校验）
+            // 不只信 dy——上滚前插/下滚追加都过这道闸门，错位置一律丢弃不焊
+            let p = lastPos + dy
+            let lo = max(capturedTop, p)
+            let hi = min(capturedBottom, p + nf.h)
+            if hi - lo >= 60,
+               let ref = compositeRows(lo, hi - lo),
+               let nfPart = nf.cg.cropping(to: CGRect(x: 0, y: lo - p, width: nf.w, height: hi - lo)) {
+                let e = Self.stripError(prev: ref, new: Frame(nfPart), dy: 0)
+                if e > 3.0 {
+                    lastPos = prevPos
+                    lastFrame = prev
+                    nilStreak = max(nilStreak, 1)
+                    borderView?.warning = "位置不符 · 已丢弃本帧，请回滚重试"
+                    fputs("[ShotMark] splice rejected: p=\(p) seamErr=\(String(format: "%.2f", e))\n", stderr)
+                    return
+                }
+            }
             let appended = applyMatch(dy: dy, nf: nf)
             // 静止提示，不自动完成：中途停顿与真正页尾无法区分，禁止误判收尾
             // （用户事故：刚滚一点停下就被当成页尾自动完成）。没新内容本就不追加。
