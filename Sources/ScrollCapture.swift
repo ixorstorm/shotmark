@@ -511,20 +511,41 @@ final class ScrollCaptureSession: NSObject {
         return best < 3.0
     }
 
-    /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复
+    /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复。
+    /// 用 NSBitmapImageRep.colorAt 安全读像素，不碰裸数据指针（实测裸读会 EXC_BAD_ACCESS）。
     func duplicateNearTop(nf: Frame, o: Int) -> Bool {
         let len = min(220, capturedTop - o, nf.h)
-        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
-        let cand = Frame(candCG)
+        guard len >= 60,
+              let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
+        let candRep = NSBitmapImageRep(cgImage: candCG)
         let searchH = min(capturedBottom - capturedTop, 2 * nf.h)
         guard let ref = compositeRows(capturedTop, searchH) else { return false }
+        let refRep = NSBitmapImageRep(cgImage: ref.cg)
         var best = Double.greatestFiniteMagnitude
         var bestOff = -1
         var off = 0
         let maxOff = ref.h - len
         while off <= maxOff {
-            let e = Self.stripError(prev: ref, new: cand, dy: off)
-            if e < best { best = e; bestOff = off }
+            var sum = 0.0, n = 0.0
+            var yy = 0
+            while yy < len {
+                let ry = yy + off
+                if ry < refRep.pixelsHigh {
+                    var xx = 8
+                    while xx + 8 < nf.w {
+                        if let a = refRep.colorAt(x: xx, y: ry), let b = candRep.colorAt(x: xx, y: yy) {
+                            sum += Double(abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)) * 255
+                            n += 3
+                        }
+                        xx += 32
+                    }
+                }
+                yy += 8
+            }
+            if n > 0 {
+                let e = sum / n
+                if e < best { best = e; bestOff = off }
+            }
             off += 8
         }
         return best < 3.0
