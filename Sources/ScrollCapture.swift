@@ -123,13 +123,6 @@ final class ScrollCaptureSession: NSObject {
         tick()
     }
 
-    var isTornDown: Bool { tornDown }
-
-    /// 驱动器收尾（达到最大拍数/用户停止）：等同 finish
-    func finishFromDriver() {
-        finish()
-    }
-
     func finish() {
         guard !tornDown else { return }
         tornDown = true
