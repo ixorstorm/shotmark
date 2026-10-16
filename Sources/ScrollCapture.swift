@@ -634,7 +634,7 @@ final class ScrollCaptureSession: NSObject {
             }
             // 重定位失败：本帧丢弃，位置账本不动；提示用户回滚到已拼画面重试
             nilStreak = min(nilStreak + 1, 50)
-            borderView?.warning = "滚动过快 · 请回滚到已拼过的画面重试"
+            borderView?.warning = "未找到可靠拼接位置 · 回滚到已拼过的画面重试"
             debugLog(detail: detail, appended: 0)
             return
         }
@@ -753,7 +753,7 @@ final class ScrollCaptureSession: NSObject {
         if nilStreak >= 2 {
             diag("unmatchable")
             diagnostics?.saveAnomaly(nf.cg, tag: "unmatchable")
-            borderView?.warning = "滚动过快 · 请回滚到已拼过的画面重试"
+            borderView?.warning = "未找到可靠拼接位置 · 回滚到已拼过的画面重试"
             fputs("[ShotMark] frame skipped (unmatchable, retry by scrolling back)\n", stderr)
         }
         debugLog(detail: detail, appended: 0)
