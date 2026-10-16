@@ -368,10 +368,35 @@ final class ScrollCaptureSession: NSObject {
            let nfPart = nf.cg.cropping(to: CGRect(x: 0, y: lo - p, width: nf.w, height: hi - lo)) {
             let e = Self.stripError(prev: ref, new: Frame(nfPart), dy: 0)
             if e > 3.0 {
-                diag("apply_rejected", ["p": String(p), "seamErr": String(format: "%.2f", e)])
-                diagnostics?.saveAnomaly(nf.cg, tag: "apply-reject")
-                diagnostics?.saveAnomaly(ref.cg, tag: "apply-ref")
-                return 0
+                // 接缝不匹配不一定是错位，也可能是内容变了（头像/消息渲染更新）。
+                // 先把候选新段放到整幅长图里全局查重：找到=已拼过（校准不拼），找不到=内容变了（允许继续拼）。
+                if dy < 0 {
+                    let newAbove = capturedTop - p
+                    if newAbove > 40 {
+                        let take = min(220, newAbove, nf.h)
+                        if take >= 60,
+                           let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: take)),
+                           let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
+                            lastPos = dupOff
+                            diag("dup_top_skip", ["off": String(dupOff)])
+                            return 0
+                        }
+                    }
+                } else {
+                    let newBelow = (p + nf.h) - capturedBottom
+                    if newBelow > 40 {
+                        let take = min(220, newBelow)
+                        let y = capturedBottom - p
+                        if take >= 60, y >= 0, y + take <= nf.h,
+                           let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: take)),
+                           let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
+                            lastPos = dupOff
+                            diag("dup_bottom_skip", ["off": String(dupOff)])
+                            return 0
+                        }
+                    }
+                }
+                diag("content_changed_accept", ["p": String(p), "seamErr": String(format: "%.2f", e)])
             }
         }
         nilStreak = 0
@@ -716,46 +741,6 @@ final class ScrollCaptureSession: NSObject {
             let prevPos = lastPos
             // 双向拼接前图比图：候选位置与长图对应区必须近乎全等（直接像素校验）
             // 不只信 dy——上滚前插/下滚追加都过这道闸门，错位置一律丢弃不焊
-            let p = lastPos + dy
-            let lo = max(capturedTop, p)
-            let hi = min(capturedBottom, p + nf.h)
-            if hi - lo >= 60,
-               let ref = compositeRows(lo, hi - lo),
-               let nfPart = nf.cg.cropping(to: CGRect(x: 0, y: lo - p, width: nf.w, height: hi - lo)) {
-                let e = Self.stripError(prev: ref, new: Frame(nfPart), dy: 0)
-                if e > 3.0 {
-                    // 接缝不匹配不一定是错位，也可能是内容变了（头像/消息渲染更新）。
-                    // 先把候选新段放到整幅长图里全局查重：找到=已拼过（校准不拼），找不到=内容变了（允许继续拼）。
-                    if dy < 0 {
-                        let newAbove = capturedTop - p
-                        if newAbove > 40 {
-                            let take = min(220, newAbove, nf.h)
-                            if take >= 60,
-                               let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: take)),
-                               let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
-                                lastPos = dupOff
-                                diag("dup_top_skip", ["off": String(dupOff)])
-                                return
-                            }
-                        }
-                    } else {
-                        let newBelow = (p + nf.h) - capturedBottom
-                        if newBelow > 40 {
-                            let take = min(220, newBelow)
-                            let y = capturedBottom - p
-                            if take >= 60, y >= 0, y + take <= nf.h,
-                               let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: take)),
-                               let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
-                                lastPos = dupOff
-                                diag("dup_bottom_skip", ["off": String(dupOff)])
-                                return
-                            }
-                        }
-                    }
-                    diag("content_changed_accept", ["p": String(p), "seamErr": String(format: "%.2f", e)])
-                    fputs("[ShotMark] seam mismatch but no duplicate found -> accept (content changed): p=\(p) seamErr=\(String(format: "%.2f", e))\n", stderr)
-                }
-            }
             let appended = applyMatch(dy: dy, nf: nf)
             diag("apply", ["p": String(lastPos), "appended": String(appended), "dy": String(dy)])
             // 静止提示，不自动完成：中途停顿与真正页尾无法区分，禁止误判收尾
