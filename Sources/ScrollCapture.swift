@@ -377,6 +377,22 @@ final class ScrollCaptureSession: NSObject {
         nilStreak = 0
         borderView?.warning = nil
         var appended = 0
+        // 重复段拦截：新追加内容若在长图尾部邻域近乎全等，说明已拼过，只校准不追加
+        if dy >= 0 {
+            let newBelow = (p + nf.h) - capturedBottom
+            if newBelow > 40, duplicateNearBottom(nf: nf, o: p) {
+                lastPos = p
+                diag("dup_bottom_skip", ["o": String(p)])
+                return 0
+            }
+        } else {
+            let newAbove = capturedTop - p
+            if newAbove > 40, duplicateNearTop(nf: nf, o: p) {
+                lastPos = p
+                diag("dup_top_skip", ["o": String(p)])
+                return 0
+            }
+        }
         if dy >= 0 {
             // 底部追加超出水位线的部分；跳过帧顶停靠行（固定 UI 不重复拼入）
             let start = max(capturedBottom - p, stickyH)
