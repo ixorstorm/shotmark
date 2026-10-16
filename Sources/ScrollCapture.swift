@@ -102,16 +102,33 @@ final class ScrollCaptureSession: NSObject {
     /// 已销毁：阻断 finish/cancel 重入与 in-flight 抓帧复活窗口
     private var tornDown = false
 
+    private var diagnostics: ScrollDiagnostics?
+
     init(screen: NSScreen, regionPts: CGRect, snapshot: NSImage? = nil, onFinish: @escaping (NSImage?) -> Void) {
         self.screen = screen
         self.regionPts = regionPts
         self.snapshot = snapshot
         self.onFinish = onFinish
+        self.diagnostics = ScrollDiagnostics(region: regionPts)
+    }
+
+    /// 统一会话诊断：每次事件都带位置账本与水位线，便于离线还原全过程
+    private func diag(_ name: String, _ extra: [String: String] = [:]) {
+        var fields: [String: String] = [
+            "lastPos": String(lastPos),
+            "capturedTop": String(capturedTop),
+            "capturedBottom": String(capturedBottom),
+            "nilStreak": String(nilStreak),
+            "staticTicks": String(staticTicks),
+        ]
+        for (k, v) in extra { fields[k] = v }
+        diagnostics?.event(name, fields)
     }
 
     // MARK: - 生命周期
 
     func start() {
+        diag("start")
         showBorder()
         // 清单缓存作废：边框窗刚刚创建，抓帧的排除列表必须带上它（否则会把自己抓进长图）
         Capture.invalidateContentCache()
@@ -127,6 +144,8 @@ final class ScrollCaptureSession: NSObject {
         guard !tornDown else { return }
         tornDown = true
         let img = compose()
+        diag("finish", ["height": String(capturedBottom - capturedTop)])
+        diagnostics?.saveComposite(img)
         teardown()
         onFinish(img)
     }
@@ -134,6 +153,7 @@ final class ScrollCaptureSession: NSObject {
     func cancel() {
         guard !tornDown else { return }
         tornDown = true
+        diag("cancel")
         teardown()
         onFinish(nil)
     }
@@ -550,6 +570,7 @@ final class ScrollCaptureSession: NSObject {
             capturedBottom = nf.h
             capturedTop = 0
             lastPos = 0
+            diag("first_frame", ["h": String(nf.h), "w": String(nf.w)])
             updatePreview(force: true)
             return
         }
@@ -562,6 +583,13 @@ final class ScrollCaptureSession: NSObject {
         guard let prev = lastFrame else { return }
         let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
         debugDys.append(detail.dy)
+        diag("tick", [
+            "dy": detail.dy.map { String($0) } ?? "nil",
+            "fineErr": detail.fineErr > 1e10 ? "GFM" : String(format: "%.2f", detail.fineErr),
+            "secondErr": detail.secondErr > 1e10 ? "GFM" : String(format: "%.2f", detail.secondErr),
+            "tex": String(detail.tex),
+        ])
+        diagnostics?.saveRoutineIfDue(nf.cg)
         if SMDebugOn {
             let dyStr = detail.dy.map { String($0) } ?? "nil"
             let errStr = detail.fineErr > 1e10 ? "GFM" : String(format: "%.2f", detail.fineErr)
@@ -570,6 +598,7 @@ final class ScrollCaptureSession: NSObject {
         }
         // ① 幻影预检：匹配声称的帧顶超出长图底 - 40 = 无重叠证据的匹配，不可信
         if let dy = detail.dy, lastPos + dy > capturedBottom - 40 {
+            diag("precheck", ["p": String(lastPos + dy)])
             if let o = relocateAgainstBottomBand(nf: nf) ?? relocateAgainstTopBand(nf: nf) {
                 let newBelow = (o + nf.h) - capturedBottom
                 let newAbove = capturedTop - o
@@ -579,6 +608,7 @@ final class ScrollCaptureSession: NSObject {
                     let ap = applyMatch(dy: o - lastPos, nf: nf)
                     nilStreak = 0
                     borderView?.warning = nil
+                    diag("precheck_recovered", ["o": String(o), "appended": String(ap)])
                     fputs("[ShotMark] precheck-recovered: o=\(o) append=\(ap)\n", stderr)
                     return
                 }
@@ -611,16 +641,21 @@ final class ScrollCaptureSession: NSObject {
                     lastFrame = prev
                     nilStreak = max(nilStreak, 1)
                     borderView?.warning = "位置不符 · 已丢弃本帧，请回滚重试"
+                    diag("splice_rejected", ["p": String(p), "seamErr": String(format: "%.2f", e)])
+                    diagnostics?.saveAnomaly(nf.cg, tag: "splice-reject")
+                    diagnostics?.saveAnomaly(ref.cg, tag: "splice-ref")
                     fputs("[ShotMark] splice rejected: p=\(p) seamErr=\(String(format: "%.2f", e))\n", stderr)
                     return
                 }
             }
             let appended = applyMatch(dy: dy, nf: nf)
+            diag("apply", ["p": String(lastPos), "appended": String(appended), "dy": String(dy)])
             // 静止提示，不自动完成：中途停顿与真正页尾无法区分，禁止误判收尾
             // （用户事故：刚滚一点停下就被当成页尾自动完成）。没新内容本就不追加。
             if dy == 0, appended == 0 {
                 staticTicks = min(staticTicks + 1, 60)
                 if staticTicks == 12 {
+                    diag("static", ["count": String(staticTicks)])
                     borderView?.warning = "画面已静止 · 回车/空格完成 · Esc 取消"
                 }
             } else {
@@ -690,6 +725,7 @@ final class ScrollCaptureSession: NSObject {
             return
         }
         if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
+            diag("reanchor", ["pos": String(pos), "dy": String(dy2)])
             lastFrame = slice
             lastPos = pos              // ⚠️ 先切到 slice 的坐标基准，dy2 才相对它
             let appended = applyMatch(dy: dy2, nf: nf)
@@ -700,6 +736,8 @@ final class ScrollCaptureSession: NSObject {
         // 匹配失败：本帧丢弃，位置账本不动；连续失败只提示回滚，不截断会话
         nilStreak = min(nilStreak + 1, 50)
         if nilStreak >= 2 {
+            diag("unmatchable")
+            diagnostics?.saveAnomaly(nf.cg, tag: "unmatchable")
             borderView?.warning = "滚动过快 · 请回滚到已拼过的画面重试"
             fputs("[ShotMark] frame skipped (unmatchable, retry by scrolling back)\n", stderr)
         }

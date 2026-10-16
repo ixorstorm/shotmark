@@ -130,3 +130,14 @@ Sources/
 ## 项目沿革
 
 - 2026-10-08：应用户要求从 PyObjC 方案推翻重写为 Swift 原生；初版曾短暂落 `dev/shotmark/`（独立 git，2 commits），用户拍板「按正常项目保存」后迁入 `work/shotmark/`，随 workspace git 全机同步。原 dev/ 目录与 raynor 上的 bare 备份仓已清理（迁移后由 workspace 同步承担备份）。
+
+## 调试与全量诊断
+
+每个滚动会话都会在 `$TMPDIR/shotmark-debug/<时间戳>/` 落盘：
+
+- `scroll.jsonl`：会话事件流（首帧、每拍 dy/fineErr/secondErr/tex、lastPos/capturedTop/capturedBottom、追加/前插、预检、验伪、重锚定、拼接拒绝、失配、静止、完成/取消）
+- `frame-N-routine.jpg`：每 8 拍一张常规帧（保留最近 160 张）
+- `frame-N-<tag>.png`：失配/拼接拒绝/重锚定等异常帧（全量保留）
+- `finish.png`：最终拼接结果
+
+写盘在后台队列执行，不阻塞滚动抓帧。复现问题后把该目录发来即可做完整复盘，无需描述操作过程。
