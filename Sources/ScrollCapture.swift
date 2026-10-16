@@ -388,6 +388,12 @@ final class ScrollCaptureSession: NSObject {
             }
         } else {
             // 用户上滚：顶部前插水位线之上的新内容（帧顶 stickyH 行是固定 UI，跳过）
+            // 完全没有重叠证据时先查重：已拼过的内容不再前插（实测事故：零重叠大上滚把重复内容整段前插）
+            if p + nf.h <= capturedTop, duplicateNearTop(nf: nf, o: p) {
+                lastPos = p
+                diag("dup_top_skip", ["o": String(p)])
+                return 0
+            }
             let headRows = capturedTop - p - stickyH
             if headRows > 0 {
                 let take = min(headRows, nf.h - stickyH)

@@ -427,8 +427,11 @@ enum SelfTest {
         session.process(newFrame: ScrollCaptureSession.Frame(a))
         let dup = session.duplicateNearBottom(nf: ScrollCaptureSession.Frame(a), o: 400)
         let unique = session.duplicateNearBottom(nf: ScrollCaptureSession.Frame(b), o: 400)
-        let ok = dup && !unique
-        print("duplicateDetection: repeated=\(dup) unique=\(unique) -> \(ok ? "PASS" : "FAIL")")
+        // 顶部方向同样验证：完全在长图上方且内容重复 → 判重复；独有内容不误判
+        let dupTop = session.duplicateNearTop(nf: ScrollCaptureSession.Frame(a), o: -400)
+        let uniqueTop = session.duplicateNearTop(nf: ScrollCaptureSession.Frame(b), o: -400)
+        let ok = dup && !unique && dupTop && !uniqueTop
+        print("duplicateDetection: bottom repeated=\(dup) unique=\(unique) top repeated=\(dupTop) unique=\(uniqueTop) -> \(ok ? "PASS" : "FAIL")")
         return ok
     }
 
