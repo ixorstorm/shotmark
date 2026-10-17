@@ -1,3 +1,6 @@
 ShotMark.app/
 build/
 .DS_Store
+__pycache__/
+*.py[cod]
+linux/build/

@@ -102,51 +102,38 @@ final class ScrollCaptureSession: NSObject {
     /// 已销毁：阻断 finish/cancel 重入与 in-flight 抓帧复活窗口
     private var tornDown = false
 
-    private var diagnostics: ScrollDiagnostics?
-
     init(screen: NSScreen, regionPts: CGRect, snapshot: NSImage? = nil, onFinish: @escaping (NSImage?) -> Void) {
         self.screen = screen
         self.regionPts = regionPts
         self.snapshot = snapshot
         self.onFinish = onFinish
-        self.diagnostics = ScrollDiagnostics(region: regionPts)
-    }
-
-    /// 统一会话诊断：每次事件都带位置账本与水位线，便于离线还原全过程
-    private func diag(_ name: String, _ extra: [String: String] = [:]) {
-        var fields: [String: String] = [
-            "lastPos": String(lastPos),
-            "capturedTop": String(capturedTop),
-            "capturedBottom": String(capturedBottom),
-            "nilStreak": String(nilStreak),
-            "staticTicks": String(staticTicks),
-        ]
-        for (k, v) in extra { fields[k] = v }
-        diagnostics?.event(name, fields)
     }
 
     // MARK: - 生命周期
 
     func start() {
-        diag("start")
         showBorder()
         // 清单缓存作废：边框窗刚刚创建，抓帧的排除列表必须带上它（否则会把自己抓进长图）
         Capture.invalidateContentCache()
         hotKeyRefs = HotKey.registerRaw(keys: [49, 36, 53]) { [weak self] code in
             guard let self = self else { return }
-            self.diag("hotkey", ["code": String(code)])
             if code == 53 { self.cancel() } else { self.finish() }
         }
         scheduleTimer(0.15)
         tick()
     }
 
+    var isTornDown: Bool { tornDown }
+
+    /// 驱动器收尾（达到最大拍数/用户停止）：等同 finish
+    func finishFromDriver() {
+        finish()
+    }
+
     func finish() {
         guard !tornDown else { return }
         tornDown = true
         let img = compose()
-        diag("finish", ["height": String(capturedBottom - capturedTop)])
-        diagnostics?.saveComposite(img)
         teardown()
         onFinish(img)
     }
@@ -154,7 +141,6 @@ final class ScrollCaptureSession: NSObject {
     func cancel() {
         guard !tornDown else { return }
         tornDown = true
-        diag("cancel")
         teardown()
         onFinish(nil)
     }
@@ -218,32 +204,14 @@ final class ScrollCaptureSession: NSObject {
         }
         guard bestOff >= 0, bestErr < 8.0 else { return nil }
 
-        // 全分辨率验证：裁长图对应切片，先走既有的五闸门匹配器
+        // 全分辨率验证：裁长图对应切片，走既有的五闸门匹配器
         let pos = capturedTop + bestOff * 4
         let sliceTop = min(max(capturedTop, pos - 32), capturedBottom - nf.h)
         guard let sliceCG = acc.cg.cropping(to: CGRect(x: 0, y: sliceTop - capturedTop, width: nf.w, height: nf.h)) else { return nil }
         let sliceFrame = Frame(sliceCG)
         let detail = Self.scrollDeltaDetailed(prev: sliceFrame, new: nf)
-        if detail.dy != nil { return (sliceFrame, sliceTop, detail) }
-
-        // 五闸门全拒时走绝对位置精细校验（uniform list 上 fineErr≈secondErr 会误伤真匹配）：
-        // 粗搜位置 ±32 内逐像素滑窗，取绝对误差最小者；只有近乎全等（<3.0）才认锚，
-        // 不再依赖 fineErr < 0.6×secondErr 的显著性判据。
-        var bestAbs = Int.min
-        var bestFine = Double.greatestFiniteMagnitude
-        for d in -32...32 {
-            let top = pos + d
-            guard top >= capturedTop, top + nf.h <= capturedBottom else { continue }
-            guard let cg = acc.cg.cropping(to: CGRect(x: 0, y: top - capturedTop, width: nf.w, height: nf.h)) else { continue }
-            let sf = Frame(cg)
-            let e = Self.stripError(prev: sf, new: nf, dy: 0)
-            if e < bestFine { bestFine = e; bestAbs = d }
-        }
-        guard bestAbs != Int.min, bestFine < 3.0 else { return nil }
-        let finalTop = pos + bestAbs
-        guard let finalCG = acc.cg.cropping(to: CGRect(x: 0, y: finalTop - capturedTop, width: nf.w, height: nf.h)) else { return nil }
-        let finalDetail = ScrollDeltaDetail(dy: 0, fineErr: bestFine, secondErr: bestFine, tex: 0)
-        return (Frame(finalCG), finalTop, finalDetail)
+        guard detail.dy != nil else { return nil }
+        return (sliceFrame, sliceTop, detail)
     }
 
     /// 小尺度偏置误差：acc 的 [off, off+nf.h) vs nf 的 [0, nf.h)
@@ -358,49 +326,9 @@ final class ScrollCaptureSession: NSObject {
 
     /// 把一次匹配结果落到水位线/片段上（主匹配与重锚定共用）
     private func applyMatch(dy: Int, nf: Frame) -> Int {
-        let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
-        // 所有路径统一图比图闸门：候选位置与长图对应区必须近乎全等才允许拼接。
-        // 覆盖普通匹配、预检恢复、幻影恢复、重锚定——任何错锚都在这里被拒绝。
-        let lo = max(capturedTop, p)
-        let hi = min(capturedBottom, p + nf.h)
-        if hi - lo >= 60,
-           let ref = compositeRows(lo, hi - lo),
-           let nfPart = nf.cg.cropping(to: CGRect(x: 0, y: lo - p, width: nf.w, height: hi - lo)) {
-            let e = Self.stripError(prev: ref, new: Frame(nfPart), dy: 0)
-            if e > 3.0 {
-                // 接缝不匹配不一定是错位，也可能是内容变了（头像/消息渲染更新）。
-                // 先把候选新段放到整幅长图里全局查重：找到=已拼过（校准不拼），找不到=内容变了（允许继续拼）。
-                if dy < 0 {
-                    let newAbove = capturedTop - p
-                    if newAbove > 40 {
-                        let take = min(220, newAbove, nf.h)
-                        if take >= 60,
-                           let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: take)),
-                           let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
-                            lastPos = dupOff
-                            diag("dup_top_skip", ["off": String(dupOff)])
-                            return 0
-                        }
-                    }
-                } else {
-                    let newBelow = (p + nf.h) - capturedBottom
-                    if newBelow > 40 {
-                        let take = min(220, newBelow)
-                        let y = capturedBottom - p
-                        if take >= 60, y >= 0, y + take <= nf.h,
-                           let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: take)),
-                           let dupOff = findDuplicatePosition(cand: Frame(candCG)) {
-                            lastPos = dupOff
-                            diag("dup_bottom_skip", ["off": String(dupOff)])
-                            return 0
-                        }
-                    }
-                }
-                diag("content_changed_accept", ["p": String(p), "seamErr": String(format: "%.2f", e)])
-            }
-        }
         nilStreak = 0
         borderView?.warning = nil
+        let p = lastPos + dy                       // 本帧顶部的绝对位置（dy>0 内容上移 / dy<0 用户上滚）
         var appended = 0
         if dy >= 0 {
             // 底部追加超出水位线的部分；跳过帧顶停靠行（固定 UI 不重复拼入）
@@ -413,12 +341,6 @@ final class ScrollCaptureSession: NSObject {
             }
         } else {
             // 用户上滚：顶部前插水位线之上的新内容（帧顶 stickyH 行是固定 UI，跳过）
-            // 完全没有重叠证据时先查重：已拼过的内容不再前插（实测事故：零重叠大上滚把重复内容整段前插）
-            if p + nf.h <= capturedTop, duplicateNearTop(nf: nf, o: p) {
-                lastPos = p
-                diag("dup_top_skip", ["o": String(p)])
-                return 0
-            }
             let headRows = capturedTop - p - stickyH
             if headRows > 0 {
                 let take = min(headRows, nf.h - stickyH)
@@ -497,109 +419,44 @@ final class ScrollCaptureSession: NSObject {
 
     /// 重复检测：候选新增头部若能与长图尾部邻域（capturedBottom - 2H … capturedBottom）任一偏移对齐，
     /// 则为已拼内容的重复（均匀列表来回滚的歧义定位所致），不拼。
-    /// 用 NSBitmapImageRep.colorAt 安全读像素，不碰裸数据指针（实测重复检测裸读会 EXC_BAD_ACCESS）。
-    func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
+    private func duplicateNearBottom(nf: Frame, o: Int) -> Bool {
         let headTop = capturedBottom
         let len = min(220, o + nf.h - headTop)
-        let y = max(0, headTop - o)
-        let safeLen = min(len, nf.h - y)
-        guard safeLen >= 60,
-              let candCG = nf.cg.cropping(to: CGRect(x: 0, y: y, width: nf.w, height: safeLen)) else { return false }
-        let candRep = NSBitmapImageRep(cgImage: candCG)
+        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: headTop - o, width: nf.w, height: len)) else { return false }
+        let cand = Frame(candCG)
         let searchTop = max(capturedTop, capturedBottom - 2 * nf.h)
         guard let ref = compositeRows(searchTop, capturedBottom - searchTop) else { return false }
-        let refRep = NSBitmapImageRep(cgImage: ref.cg)
-        var best = Double.greatestFiniteMagnitude
-        var bestOff = -1
-        var off = 0
-        let maxOff = ref.h - safeLen
-        while off <= maxOff {
-            var sum = 0.0, n = 0.0
-            var yy = 0
-            while yy < safeLen {
-                let ry = yy + off
-                if ry < refRep.pixelsHigh {
-                    var xx = 8
-                    while xx + 8 < nf.w {
-                        if let a = refRep.colorAt(x: xx, y: ry), let b = candRep.colorAt(x: xx, y: yy) {
-                            // NSColor 分量是 0-1，转成 0-255 与 stripError 同尺度（阈值 3.0 = 每通道平均 1）
-                            sum += Double(abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)) * 255
-                            n += 3
-                        }
-                        xx += 32
-                    }
-                }
-                yy += 8
-            }
-            if n > 0 {
-                let e = sum / n
-                if e < best { best = e; bestOff = off }
-            }
-            off += 8
-        }
-        let line = "[ShotMark] dupBottom check: seamErr=" + String(format: "%.2f", best) + " at composite row " + String(searchTop + bestOff)
-        fputs(line + "\n", stderr)
-        return best < 3.0
-    }
-
-    /// 全局查重：把候选内容（>40px 的新段）在整幅长图里按行搜索。
-    /// 找到近乎全等的位置 = 已拼过，返回该位置的绝对行；找不到 = 内容变了/新内容，允许继续拼。
-    func findDuplicatePosition(cand: Frame) -> Int? {
-        guard cand.h >= 60 else { return nil }
-        guard let ref = compositeRows(capturedTop, capturedBottom - capturedTop) else { return nil }
-        var best = Double.greatestFiniteMagnitude
-        var bestOff = -1
-        var off = 0
-        let maxOff = ref.h - cand.h
-        while off <= maxOff {
-            if let sub = ref.cg.cropping(to: CGRect(x: 0, y: off, width: ref.w, height: cand.h)) {
-                let e = Self.stripError(prev: Frame(sub), new: cand, dy: 0)
-                if e < best { best = e; bestOff = off }
-            }
-            off += 8
-        }
-        guard bestOff >= 0, best < 3.0 else { return nil }
-        return capturedTop + bestOff
-    }
-
-    /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复。
-    /// 用 NSBitmapImageRep.colorAt 安全读像素，不碰裸数据指针（实测裸读会 EXC_BAD_ACCESS）。
-    func duplicateNearTop(nf: Frame, o: Int) -> Bool {
-        let len = min(220, capturedTop - o, nf.h)
-        guard len >= 60,
-              let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
-        let candRep = NSBitmapImageRep(cgImage: candCG)
-        let searchH = min(capturedBottom - capturedTop, 2 * nf.h)
-        guard let ref = compositeRows(capturedTop, searchH) else { return false }
-        let refRep = NSBitmapImageRep(cgImage: ref.cg)
-        var best = Double.greatestFiniteMagnitude
+        var best = 1.0
         var bestOff = -1
         var off = 0
         let maxOff = ref.h - len
         while off <= maxOff {
-            var sum = 0.0, n = 0.0
-            var yy = 0
-            while yy < len {
-                let ry = yy + off
-                if ry < refRep.pixelsHigh {
-                    var xx = 8
-                    while xx + 8 < nf.w {
-                        if let a = refRep.colorAt(x: xx, y: ry), let b = candRep.colorAt(x: xx, y: yy) {
-                            sum += Double(abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)) * 255
-                            n += 3
-                        }
-                        xx += 32
-                    }
-                }
-                yy += 8
-            }
-            if n > 0 {
-                let e = sum / n
-                if e < best { best = e; bestOff = off }
-            }
+            let e = Self.mismatchRatio(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            if e < best { best = e; bestOff = off }
             off += 8
         }
-        return best < 3.0
+        let line = "[ShotMark] dupBottom check: mismatch=" + String(format: "%.2f", best) + " at composite row " + String(searchTop + bestOff)
+        fputs(line + "\n", stderr)
+        return best < 0.15
+    }
+
+    /// 重复检测（前插方向）：候选前插内容若能与长图头部对齐，则为重复
+    private func duplicateNearTop(nf: Frame, o: Int) -> Bool {
+        let len = min(220, capturedTop - o)
+        guard len >= 60, let candCG = nf.cg.cropping(to: CGRect(x: 0, y: 0, width: nf.w, height: len)) else { return false }
+        let cand = Frame(candCG)
+        let searchH = min(capturedBottom - capturedTop, 2 * nf.h)
+        guard let ref = compositeRows(capturedTop, searchH) else { return false }
+        var best = 1.0
+        var bestOff = -1
+        var off = 0
+        let maxOff = ref.h - len
+        while off <= maxOff {
+            let e = Self.mismatchRatio(prev: ref, new: cand, dy: off, rowLo: 0, rowHi: len - 1)
+            if e < best { best = e; bestOff = off }
+            off += 8
+        }
+        return best < 0.15
     }
 
     /// 下滚甩出恢复：长图底部带 vs 新帧头部对齐，返回帧顶绝对位置 o（锐利最小值判据）。
@@ -682,7 +539,6 @@ final class ScrollCaptureSession: NSObject {
             capturedBottom = nf.h
             capturedTop = 0
             lastPos = 0
-            diag("first_frame", ["h": String(nf.h), "w": String(nf.w)])
             updatePreview(force: true)
             return
         }
@@ -695,13 +551,6 @@ final class ScrollCaptureSession: NSObject {
         guard let prev = lastFrame else { return }
         let detail = Self.scrollDeltaDetailed(prev: prev, new: nf)
         debugDys.append(detail.dy)
-        diag("tick", [
-            "dy": detail.dy.map { String($0) } ?? "nil",
-            "fineErr": detail.fineErr > 1e10 ? "GFM" : String(format: "%.2f", detail.fineErr),
-            "secondErr": detail.secondErr > 1e10 ? "GFM" : String(format: "%.2f", detail.secondErr),
-            "tex": String(detail.tex),
-        ])
-        diagnostics?.saveRoutineIfDue(nf.cg)
         if SMDebugOn {
             let dyStr = detail.dy.map { String($0) } ?? "nil"
             let errStr = detail.fineErr > 1e10 ? "GFM" : String(format: "%.2f", detail.fineErr)
@@ -710,7 +559,6 @@ final class ScrollCaptureSession: NSObject {
         }
         // ① 幻影预检：匹配声称的帧顶超出长图底 - 40 = 无重叠证据的匹配，不可信
         if let dy = detail.dy, lastPos + dy > capturedBottom - 40 {
-            diag("precheck", ["p": String(lastPos + dy)])
             if let o = relocateAgainstBottomBand(nf: nf) ?? relocateAgainstTopBand(nf: nf) {
                 let newBelow = (o + nf.h) - capturedBottom
                 let newAbove = capturedTop - o
@@ -720,7 +568,6 @@ final class ScrollCaptureSession: NSObject {
                     let ap = applyMatch(dy: o - lastPos, nf: nf)
                     nilStreak = 0
                     borderView?.warning = nil
-                    diag("precheck_recovered", ["o": String(o), "appended": String(ap)])
                     fputs("[ShotMark] precheck-recovered: o=\(o) append=\(ap)\n", stderr)
                     return
                 }
@@ -729,9 +576,10 @@ final class ScrollCaptureSession: NSObject {
                 nilStreak = 0
                 return
             }
-            // 重定位失败：本帧丢弃，位置账本不动；提示用户回滚到已拼画面重试
+            // 重定位失败：帧顶不可能在长图之外，账本钳到长图底，本帧放弃
+            lastFrame = nf
+            lastPos = capturedBottom
             nilStreak = min(nilStreak + 1, 50)
-            borderView?.warning = "未找到可靠拼接位置 · 回滚到已拼过的画面重试"
             debugLog(detail: detail, appended: 0)
             return
         }
@@ -739,17 +587,16 @@ final class ScrollCaptureSession: NSObject {
         // ② 常规匹配（小位移，最精确可靠）
         if let dy = detail.dy {
             let prevPos = lastPos
-            // 双向拼接前图比图：候选位置与长图对应区必须近乎全等（直接像素校验）
-            // 不只信 dy——上滚前插/下滚追加都过这道闸门，错位置一律丢弃不焊
             let appended = applyMatch(dy: dy, nf: nf)
-            diag("apply", ["p": String(lastPos), "appended": String(appended), "dy": String(dy)])
-            // 静止提示，不自动完成：中途停顿与真正页尾无法区分，禁止误判收尾
-            // （用户事故：刚滚一点停下就被当成页尾自动完成）。没新内容本就不追加。
+            // 页尾自动完成：画面完全静止（dy=0 且零追加）连续 12 拍 ≈ 1.8s
             if dy == 0, appended == 0 {
-                staticTicks = min(staticTicks + 1, 60)
-                if staticTicks == 12 {
-                    diag("static", ["count": String(staticTicks)])
-                    borderView?.warning = "画面已静止 · 回车/空格完成 · Esc 取消"
+                staticTicks += 1
+                if staticTicks >= 12 {
+                    borderView?.warning = "已到页面末尾，自动完成"
+                    fputs("[ShotMark] page end -> auto finish\n", stderr)
+                    NotificationCenter.default.post(name: Notification.Name("SMTrackingLost"), object: nil)
+                    finish()
+                    return
                 }
             } else {
                 staticTicks = 0
@@ -818,7 +665,6 @@ final class ScrollCaptureSession: NSObject {
             return
         }
         if let (slice, pos, d2) = tryReanchor(nf: nf), let dy2 = d2.dy {
-            diag("reanchor", ["pos": String(pos), "dy": String(dy2)])
             lastFrame = slice
             lastPos = pos              // ⚠️ 先切到 slice 的坐标基准，dy2 才相对它
             let appended = applyMatch(dy: dy2, nf: nf)
@@ -826,13 +672,14 @@ final class ScrollCaptureSession: NSObject {
             debugLog(detail: d2, appended: appended)
             return
         }
-        // 匹配失败：本帧丢弃，位置账本不动；连续失败只提示回滚，不截断会话
         nilStreak = min(nilStreak + 1, 50)
-        if nilStreak >= 2 {
-            diag("unmatchable")
-            diagnostics?.saveAnomaly(nf.cg, tag: "unmatchable")
-            borderView?.warning = "未找到可靠拼接位置 · 回滚到已拼过的画面重试"
-            fputs("[ShotMark] frame skipped (unmatchable, retry by scrolling back)\n", stderr)
+        if nilStreak >= 3 {
+            broken = true
+            borderView?.warning = "滚动过快，长图已在此截断"
+            fputs("[ShotMark] tracking lost -> finish partial (nilStreak=\(nilStreak))\n", stderr)
+            NotificationCenter.default.post(name: Notification.Name("SMTrackingLost"), object: nil)
+            finish()
+            return
         }
         debugLog(detail: detail, appended: 0)
     }

@@ -1,4 +1,4 @@
-# ShotMark — macOS 截图标注工具（对标飞书截图）
+# ShotMark — macOS / Linux 截图标注工具
 
 开源镜像：https://github.com/ixorstorm/shotmark （MIT，v1.0；唯一真实源仍在工作区，`scripts/publish.sh` 一键发布）
 
@@ -61,6 +61,123 @@ open ~/Applications/ShotMark.app
 | 回车 / 空格 / ⌘C | 复制到剪贴板并关闭 |
 | ⌘S | 保存 PNG 并关闭 |
 | ⌘Z | 撤销上一条标注 |
+
+---
+
+## Linux（GTK3 / X11，首版）
+
+Linux 版位于独立的 `linux/` 树，**没有改动 `Sources/` 的 Swift/AppKit 实现，也不声称与 macOS 全量等价**。本机实测基线为 Ubuntu 24.04 x86_64、单一 3840×2160 X11 屏幕、GTK scale factor 2；raw 截图像素与 GTK 逻辑坐标在边界显式换算。
+
+### 依赖与安装
+
+运行时使用：Python 3、GTK3/PyGObject、pycairo/PangoCairo、Pillow（必须带 XCB）、python-xlib、numpy。滚动自动模式另需 X 服务器的 XTEST 扩展。运行时不需要 PyQt/PySide/mss/pynput/cv2；`xclip`、`xdotool` 只用于诊断和自动化 smoke。
+
+Ubuntu 对应包名（本文只记录依赖，安装动作由用户自行决定）：
+
+```bash
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-pango-1.0 \
+  python3-pil python3-xlib python3-numpy
+# 可选诊断工具：
+sudo apt install xclip xdotool
+python3 -c 'from PIL import features; print("Pillow XCB:", features.check("xcb"))'
+```
+
+在项目根目录运行：
+
+```bash
+make linux-run                 # 常驻：注册热键并持有 CLIPBOARD
+# 等价：PYTHONPATH=linux python3 -m shotmark
+PYTHONPATH=linux python3 -m shotmark capture  # 直接弹一次截图层（UI smoke/热键冲突诊断）
+```
+
+复制后不要退出常驻进程：GTK 是剪贴板 owner，覆盖层关闭不影响粘贴，但整个 ShotMark 进程退出后，没有剪贴板管理器接管时其他应用将读不到这张图。
+
+### 热键与冲突回退
+
+首选热键是 **Ctrl+Shift+A**，再按一次或 Esc 取消。Linux 使用独占 `XGrabKey`，不会像被动监听那样让两个全屏截图客户端同时响应。若首选组合已被占用，会依次尝试：
+
+1. **Ctrl+Alt+Shift+A**（本机实测首选被占用，当前自动使用此项）
+2. Ctrl+Shift+F8
+3. Ctrl+Alt+S
+
+启动日志、桌面通知、托盘 tooltip 和截图层提示均显示**实际生效热键**。可显式覆盖，不必改源码：
+
+```bash
+SHOTMARK_HOTKEY=ctrl+shift+f8 make linux-run
+PYTHONPATH=linux python3 -m shotmark --hotkey ctrl+alt+s
+```
+
+### 已实现功能与快捷键
+
+- 鼠标拖选、选区内部移动、8 手柄 resize、实时 `W × H`；raw 像素导出采用显式半开裁剪。
+- pen / arrow / rect / ellipse / text / mosaic；红橙黄绿蓝白黑 7 色、细中粗 3 档线宽、撤销。
+- 文字在选区内用 GTK Entry 实际编辑，Enter 提交文字，再按 Enter 复制。mosaic 从**已裁剪选区底图**缩块生成，不使用灰色占位。
+- Enter / Space / Ctrl+C 复制 PNG；Ctrl+S 或「保存」写到 `~/Pictures/ShotMark/ShotMark-<时间戳>.png`；「钉图」是可关闭、可缩放的置顶预览窗。
+- 「滚动」= 手动滚轮；「自动滚」= XTEST 在选区中心发送小步长 Button5。抓帧 → 匹配/拼接 → 发送下一次滚动为 single-flight，抓帧耗时计入下一拍间隔且不重入。XTEST 不可用或注入失败会在提示条明确回退手动。
+- 拼接支持向下追加、向上前插、双向水位线去重、实时预览。最小重叠、双侧纹理、次优决断、搜索边界和三段一致性闸门不全就不猜；连续 3 次有效失配只截断并复制可信部分，不保留洞、不做启发式错拼。
+- 自动模式在 `dy=0` 且零新增连续 12 拍后判定页尾完成；抓帧失败不算静止证据。手动模式不因暂停而自动完成。滚动时 Space/Enter 完成，Esc 取消且不改旧剪贴板。
+- 自身边框严格在选区外；首帧隐藏全部自身窗口，后续对真实矩形与选区相交的 hint/预览执行 hide → `Gdk.flush` → XSync round-trip → 抓帧，避免 root 截图拼入 ShotMark 自身像素。
+
+Linux 覆盖层快捷键：
+
+| 键 | 动作 |
+|---|---|
+| 实际热键（首选 Ctrl+Shift+A） | 唤起；再按取消 |
+| Esc | 取消截图/滚动；文字编辑时先关闭编辑器 |
+| Enter / Space / Ctrl+C | 普通截图复制 PNG；滚动时 Space/Enter 完成 |
+| Ctrl+S | 保存 PNG |
+| Ctrl+Z | 撤销上一条标注 |
+
+### 测试与诊断入口
+
+```bash
+make linux-selftest         # 纯离线 unittest；不需要 DISPLAY
+make linux-capture-test     # 真实 X11：非空、多色、方差与精确尺寸断言
+make linux-ui-smoke         # 不足 1s 合成底图 GTK 交互/六类标注/文本提交/钉图
+make linux-scroll-test      # 受控真实窗口 + XTEST 自动滚动 + 自身污染/拼接像素闸门
+make linux-clipboard-test   # 外部 xclip 校验 TARGETS 与 image/png 回读（会写入测试图）
+# 直接 unittest：
+PYTHONPATH=linux python3 -m unittest discover -s linux/tests -v
+# 指定真实捕获区域：
+PYTHONPATH=linux python3 -m shotmark capture-test --region 100,100,900,700
+```
+
+诊断产物写入被 gitignore 的 `linux/build/`。离线拼接测试逐字节精确断言；真实屏幕路径另允许 mutter/GPU 合成造成的小幅色彩波动（当前实测 max 11/255），但对错位、重复、蓝边框和暗色预览污染保持很窄的失败阈值。
+
+### Linux 源码结构
+
+```text
+linux/
+├── shotmark/
+│   ├── __main__.py             # run/capture/capture-test/ui-smoke/scroll-test/clipboard-test
+│   ├── app.py                  # 常驻编排、实际热键提示、复制/保存/钉图、剪贴板生命周期
+│   ├── core/                   # 不 import GTK/X11
+│   │   ├── geometry.py         # raw 像素 Rect、移动与 8 手柄 resize
+│   │   ├── annotations.py      # 六工具模型、7 色、3 线宽、撤销文档
+│   │   ├── render.py           # Pillow 半开裁剪、像素映射、文字与底图 mosaic
+│   │   └── stitch.py           # 双向匹配闸门、水位线、去重、截断与无洞 compose
+│   ├── platform/x11/
+│   │   ├── capture.py          # Pillow XCB 截图与真实 capture smoke
+│   │   ├── hotkey.py           # XGrabKey、锁键变体、自动 fallback、会话键
+│   │   ├── wheel.py            # XTEST Button4/5 与指针恢复
+│   │   └── clipboard.py        # GTK CLIPBOARD owner，提供 image/png
+│   └── ui/
+│       ├── shot.py             # 选区、工具栏、标注预览、inline 文本与快捷键
+│       ├── scroll.py           # 边框/hint/预览与 single-flight 滚动驱动
+│       ├── widgets.py          # 钉图与 toast
+│       └── scroll_smoke.py     # 受控端到端滚动诊断（非生产截图路径）
+└── tests/                      # core 离线像素/场景单元测试
+```
+
+### Linux 已知限制（不宣称 macOS 全量 parity）
+
+- **只支持 X11。未实现原生 Wayland，也不把 Xwayland 伪装成完整 Wayland 桌面支持。** 首版按单一 X screen/当前主显示器设计，不宣称多显示器一致性。
+- OCR 未实现；序号标注未实现；钉图不能二次编辑；已提交标注暂不支持点选移动/缩放（可 Ctrl+Z 重画）。
+- 滚动结果直接复制，不回到标注层。手动快甩超出重叠量程会在 3 次失败后截断，本首版不做失速重锚；慢速滚动、回滚和自动小步长是可靠路径。
+- 不自动识别/去除吸顶栏（macOS 该实验也已回滚）：请把选区框在内容区、避开吸顶栏；低纹理/大片纯空白区会拒绝匹配，连续失败则截断而不是猜测拼接。
+- 贴图仅预览，无 macOS Finder Reveal；保存通知不自动打开文件管理器。托盘图标依赖桌面 shell 是否支持 legacy status icon，热键是主要入口。
+
+---
 
 ## 架构
 
@@ -130,14 +247,3 @@ Sources/
 ## 项目沿革
 
 - 2026-10-08：应用户要求从 PyObjC 方案推翻重写为 Swift 原生；初版曾短暂落 `dev/shotmark/`（独立 git，2 commits），用户拍板「按正常项目保存」后迁入 `work/shotmark/`，随 workspace git 全机同步。原 dev/ 目录与 raynor 上的 bare 备份仓已清理（迁移后由 workspace 同步承担备份）。
-
-## 调试与全量诊断
-
-每个滚动会话都会在 `$TMPDIR/shotmark-debug/<时间戳>/` 落盘：
-
-- `scroll.jsonl`：会话事件流（首帧、每拍 dy/fineErr/secondErr/tex、lastPos/capturedTop/capturedBottom、追加/前插、预检、验伪、重锚定、拼接拒绝、失配、静止、完成/取消）
-- `frame-N-routine.jpg`：每 8 拍一张常规帧（保留最近 160 张）
-- `frame-N-<tag>.png`：失配/拼接拒绝/重锚定等异常帧（全量保留）
-- `finish.png`：最终拼接结果
-
-写盘在后台队列执行，不阻塞滚动抓帧。复现问题后把该目录发来即可做完整复盘，无需描述操作过程。

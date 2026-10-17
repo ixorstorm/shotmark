@@ -1,13 +1,13 @@
 APP     := ShotMark.app
 BIN     := $(APP)/Contents/MacOS/ShotMark
 SRC     := $(wildcard Sources/*.swift)
-SDK     := $(shell xcrun --sdk macosx --show-sdk-path)
+SDK     = $(shell xcrun --sdk macosx --show-sdk-path)
 TARGET  := arm64-apple-macosx14.0
 GENICON := build/gen-icon
 ICNS    := build/AppIcon.icns
 ICONSET := build/ShotMark.iconset
 
-.PHONY: all run selftest install clean icon
+.PHONY: all run selftest install clean icon linux-run linux-selftest linux-capture-test linux-ui-smoke linux-scroll-test linux-clipboard-test
 
 all: $(APP)
 
@@ -41,6 +41,25 @@ run: all
 
 selftest: all
 	@$(BIN) --selftest
+
+# Linux targets are independent of the macOS default build above.
+linux-run:
+	@PYTHONPATH=linux python3 -m shotmark
+
+linux-selftest:
+	@PYTHONPATH=linux python3 -m unittest discover -s linux/tests -v
+
+linux-capture-test:
+	@PYTHONPATH=linux python3 -m shotmark capture-test
+
+linux-ui-smoke:
+	@PYTHONPATH=linux python3 -m shotmark ui-smoke
+
+linux-scroll-test:
+	@PYTHONPATH=linux python3 -m shotmark scroll-test
+
+linux-clipboard-test:
+	@PYTHONPATH=linux python3 -m shotmark clipboard-test
 
 install: all
 	@mkdir -p ~/Applications
