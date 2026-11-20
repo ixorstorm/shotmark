@@ -34,7 +34,14 @@ enum Capture {
 
     /// App 启动后后台预热 SCK/TCC 管线，让第一次按热键就命中缓存
     static func warm() {
-        Task { _ = try? await content() }
+        Task {
+            do {
+                let c = try await content()
+                AppLog.eventAnyThread("capture_warm_ok", ["displays": c.displays.count, "windows": c.windows.count])
+            } catch {
+                AppLog.eventAnyThread("capture_warm_error", ["error": String(describing: error)])
+            }
+        }
     }
 
     /// 绕过缓存拉新鲜清单（显示器过渡期/兜底重试用）
@@ -74,9 +81,23 @@ enum Capture {
         }
         let t1 = Date()
         fputs("[timing] ShareableContent \(String(format: "%.0f", t1.timeIntervalSince(t0)*1000))ms\n", stderr)
-        guard let display else { throw CaptureError.displayNotFound }
+        guard let display else {
+            AppLog.eventAnyThread("capture_error", ["stage": "display_lookup", "displayID": displayID])
+            throw CaptureError.displayNotFound
+        }
         fputs("[timing] displayID \(displayID) -> SCDisplay \(display.displayID) \(display.width)x\(display.height)\n", stderr)
-        return try await captureDisplay(display)
+        AppLog.eventAnyThread("capture_begin", ["displayID": displayID, "width": display.width, "height": display.height])
+        do {
+            let img = try await captureDisplay(display)
+            AppLog.eventAnyThread("capture_sck_ok", ["displayID": displayID, "width": img.width, "height": img.height,
+                                                      "ms": Int(Date().timeIntervalSince(t0) * 1000)])
+            return img
+        } catch {
+            let e = error as NSError
+            AppLog.eventAnyThread("capture_sck_error", ["displayID": displayID, "domain": e.domain, "code": e.code,
+                                                         "message": e.localizedDescription])
+            throw error
+        }
     }
 
     static func grab(screen: NSScreen) async throws -> CGImage {
@@ -109,7 +130,10 @@ enum Capture {
             content = try await freshContent()
             display = findDisplay(for: screen, in: content)
         }
-        guard let display else { throw CaptureError.displayNotFound }
+        guard let display else {
+            AppLog.eventAnyThread("capture_region_error", ["stage": "display_lookup", "region": NSStringFromRect(regionPts)])
+            throw CaptureError.displayNotFound
+        }
         // 排除本进程自己的窗口（边框提示窗/实时预览窗），防止被拼进长图
         let ourPID = ProcessInfo.processInfo.processIdentifier
         let excluded = content.windows.filter { $0.owningApplication?.processID == ourPID }
@@ -125,6 +149,15 @@ enum Capture {
         config.width = Int(regionPts.width * scale)
         config.height = Int(regionPts.height * scale)
         config.showsCursor = false
-        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        do {
+            let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            AppLog.eventAnyThread("capture_region_ok", ["region": NSStringFromRect(regionPts), "width": img.width, "height": img.height])
+            return img
+        } catch {
+            let e = error as NSError
+            AppLog.eventAnyThread("capture_region_error", ["region": NSStringFromRect(regionPts), "domain": e.domain,
+                                                            "code": e.code, "message": e.localizedDescription])
+            throw error
+        }
     }
 }

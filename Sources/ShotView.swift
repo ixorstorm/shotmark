@@ -55,8 +55,25 @@ final class ShotView: NSView {
     init(frame f: NSRect, captured: NSImage) {
         self.captured = captured
         super.init(frame: f)
+        AppLog.event("shotview_init", ["frame": NSStringFromRect(f),
+                                       "captured": captured.representations.first.map { "\($0.pixelsWide)x\($0.pixelsHigh)" } ?? "nil"])
     }
     required init?(coder: NSCoder) { fatalError("not supported") }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        AppLog.event("shotview_window", ["window": window.map { "\(type(of: $0))#\($0.windowNumber)" } ?? "nil"])
+    }
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        AppLog.event("shotview_become_first_responder", ["ok": ok])
+        return ok
+    }
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        AppLog.event("shotview_resign_first_responder", ["ok": ok])
+        return ok
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override var isOpaque: Bool { true }
@@ -352,6 +369,10 @@ final class ShotView: NSView {
     // MARK: - 鼠标事件
 
     override func mouseDown(with event: NSEvent) {
+        AppLog.event("shotview_mouse_down", ["point": NSStringFromPoint(event.locationInWindow),
+                                              "selection": selection.map { NSStringFromRect($0) } ?? "nil",
+                                              "windowKey": window?.isKeyWindow ?? false,
+                                              "clickCount": event.clickCount])
         window?.makeKey()
         hideHoverTip()
         let p = event.locationInWindow
@@ -360,7 +381,12 @@ final class ShotView: NSView {
         if let sel = selection {
             let (strip, items) = toolbarLayout(sel)
             if strip.contains(p) {
-                if let (btn, _) = items.first(where: { $0.1.contains(p) }) { handleButton(btn) }
+                if let (btn, _) = items.first(where: { $0.1.contains(p) }) {
+                    AppLog.event("toolbar_hit", ["button": String(describing: btn), "point": NSStringFromPoint(p)])
+                    handleButton(btn)
+                } else {
+                    AppLog.event("toolbar_miss", ["point": NSStringFromPoint(p), "strip": NSStringFromRect(strip)])
+                }
                 needsDisplay = true
                 return
             }
@@ -437,6 +463,9 @@ final class ShotView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        AppLog.event("shotview_mouse_up", ["point": NSStringFromPoint(event.locationInWindow),
+                                            "drag": String(describing: drag),
+                                            "selection": selection.map { NSStringFromRect($0) } ?? "nil"])
         switch drag {
         case .creating:
             if let sel = selection, (sel.width < 3 || sel.height < 3) { selection = nil }
@@ -467,6 +496,7 @@ final class ShotView: NSView {
     // MARK: - 工具栏动作
 
     private func handleButton(_ btn: Btn) {
+        AppLog.event("handle_button", ["button": String(describing: btn)])
         switch btn {
         case .tool(let t):
             tool = (tool == t) ? nil : t
@@ -502,11 +532,16 @@ final class ShotView: NSView {
     }
 
     private func finish(_ action: FinishAction) {
+        AppLog.event("shotview_finish_begin", ["action": String(describing: action),
+                                                "selection": selection.map { NSStringFromRect($0) } ?? "nil",
+                                                "annotations": annotations.count, "hasDelegate": delegate != nil])
         guard let sel = selection,
               let img = Render.export(captured: captured, selection: sel, annotations: annotations) else {
+            AppLog.event("shotview_export_failed")
             delegate?.shotView(self, didFinish: nil, action: nil, blank: false)
             return
         }
+        AppLog.event("shotview_export_ok", ["size": String(describing: img.size)])
         // 证据落盘（覆盖写，不攒垃圾）：白图/空图间歇问题的现场
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
         Render.writePNG(captured, to: dir.appendingPathComponent("shotmark-last-captured.png"))
@@ -536,12 +571,18 @@ final class ShotView: NSView {
             blank = n > 0 && meanLum > 248 && dark * 20 < n
             fputs("[ShotMark] export \(cg.width)x\(cg.height) meanLum=\(meanLum) dark%=\(n > 0 ? dark * 100 / n : 0) blank=\(blank)\n", stderr)
         }
+        AppLog.event("shotview_finish_delegate", ["blank": blank, "action": String(describing: action)])
         delegate?.shotView(self, didFinish: img, action: action, blank: blank)
     }
 
     // MARK: - 键盘
 
     override func keyDown(with event: NSEvent) {
+        AppLog.event("shotview_key_down", ["keyCode": event.keyCode,
+                                            "modifiers": event.modifierFlags.rawValue,
+                                            "textEditing": textField != nil,
+                                            "windowKey": window?.isKeyWindow ?? false,
+                                            "firstResponder": window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"])
         if textField != nil { super.keyDown(with: event); return }
         let cmd = event.modifierFlags.contains(.command)
         switch event.keyCode {

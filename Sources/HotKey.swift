@@ -10,6 +10,7 @@ enum HotKey {
     static var onRawKey: ((UInt32) -> Void)?
 
     static func dispatch(keyCode: UInt32) {
+        AppLog.eventAnyThread("hotkey_dispatch", ["keyCode": keyCode, "hasRaw": onRawKey != nil, "hasFire": onFire != nil])
         if let raw = onRawKey { raw(keyCode); return }
         onFire?()
     }
@@ -17,7 +18,8 @@ enum HotKey {
     static func register() -> Bool {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                  eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), hotkeyCallback, 1, &spec, nil, nil)
+        let installStatus = InstallEventHandler(GetApplicationEventTarget(), hotkeyCallback, 1, &spec, nil, nil)
+        AppLog.eventAnyThread("hotkey_install_handler", ["status": installStatus])
 
         let keyCode = UInt32(kVK_ANSI_A)
         let modifiers = UInt32(controlKey | shiftKey)
@@ -25,6 +27,7 @@ enum HotKey {
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID,
                                          GetApplicationEventTarget(), 0, &ref)
+        AppLog.eventAnyThread("hotkey_register", ["status": status, "keyCode": keyCode, "modifiers": modifiers, "hasRef": ref != nil])
         if status != noErr {
             fputs("[ShotMark] 热键注册失败（status=\(status)），可能被其他 App 占用\n", stderr)
             return false
@@ -41,12 +44,14 @@ enum HotKey {
             let st = RegisterEventHotKey(kc, 0,
                                          EventHotKeyID(signature: fourCC("SMKS"), id: UInt32(i + 1)),
                                          GetApplicationEventTarget(), 0, &ref)
+            AppLog.eventAnyThread("hotkey_register_raw", ["keyCode": kc, "status": st, "hasRef": ref != nil])
             if st == noErr { refs.append(ref) }
         }
         return refs
     }
 
     static func unregisterRaw(_ refs: [EventHotKeyRef?]) {
+        AppLog.eventAnyThread("hotkey_unregister_raw", ["count": refs.count])
         for r in refs { if let r = r { UnregisterEventHotKey(r) } }
         onRawKey = nil
     }
@@ -63,6 +68,7 @@ private func hotkeyCallback(_: EventHandlerCallRef?, event: EventRef?, _: Unsafe
         GetEventParameter(e, OSType(kEventParamKeyCode), OSType(typeUInt32), nil,
                           MemoryLayout<UInt32>.size, nil, &code)
     }
+    AppLog.eventAnyThread("hotkey_carbon_callback", ["keyCode": code])
     DispatchQueue.main.async { HotKey.dispatch(keyCode: code) }
     return noErr
 }

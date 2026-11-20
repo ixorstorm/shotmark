@@ -42,7 +42,8 @@ final class CaptureTestDelegate: NSObject, NSApplicationDelegate {
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)   // 无 Dock 图标，常驻后台
+app.setActivationPolicy(.accessory)
+AppLog.launch()   // 无 Dock 图标，常驻后台
 
 if CommandLine.arguments.contains("--capture-test") {
     app.delegate = CaptureTestDelegate()

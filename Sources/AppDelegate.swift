@@ -4,6 +4,16 @@ import CoreGraphics
 final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+    private func logWindow(_ event: String) {
+        AppLog.event(event, ["windowNumber": windowNumber, "frame": NSStringFromRect(frame),
+                             "level": level.rawValue, "visible": isVisible, "key": isKeyWindow,
+                             "canBecomeKey": canBecomeKey])
+    }
+    override func becomeKey() { super.becomeKey(); logWindow("window_become_key") }
+    override func resignKey() { super.resignKey(); logWindow("window_resign_key") }
+    override func becomeMain() { super.becomeMain(); logWindow("window_become_main") }
+    override func resignMain() { super.resignMain(); logWindow("window_resign_main") }
+    override func close() { logWindow("window_close"); super.close() }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -14,11 +24,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var scrollSession: ScrollCaptureSession?
     private var toastWin: NSWindow?
     private var toastImage: NSImage?
+    private var eventMonitors: [Any] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppLog.event("did_finish_launching")
+        installEventMonitors()
         setupStatusItem()
         Capture.warm()   // 后台预热 SCK 管线 + 内容清单缓存
         let hotkeyOK = HotKey.register()
+        AppLog.event("startup", ["hotkeyOK": hotkeyOK, "capturePreflight": CGPreflightScreenCaptureAccess(),
+                                 "screens": NSScreen.screens.count])
         HotKey.onFire = { [weak self] in self?.startCapture() }
         if !hotkeyOK {
             statusItem?.button?.title = "⚠️"
@@ -82,18 +97,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 截图入口
 
     @objc func startCapture() {
-        if scrollSession != nil { return }     // 滚动截屏进行中，忽略
+        AppLog.event("capture_request", ["scrollActive": scrollSession != nil, "overlayCount": overlays.count])
+        if scrollSession != nil {
+            AppLog.event("capture_ignored", ["reason": "scroll_active"])
+            return
+        }
         if !overlays.isEmpty {           // 已有覆盖层 = 再按一次热键关闭
+            AppLog.event("capture_toggle_close")
             closeOverlays()
             return
         }
         // 锁屏时 SCK 只能抓到壁纸（锁屏盖住所有窗口是 macOS 隐私设计）——直接不弹
         if let d = CGSessionCopyCurrentDictionary() as? [String: Any],
            (d["CGSSessionScreenIsLocked"] as? Bool) == true {
+            AppLog.event("capture_ignored", ["reason": "screen_locked"])
             fputs("[ShotMark] 屏幕已锁定，跳过截图（锁屏下只能抓到壁纸）\n", stderr)
             return
         }
         guard CGPreflightScreenCaptureAccess() else {
+            AppLog.event("capture_permission_missing")
             CGRequestScreenCaptureAccess()
             alert("需要「屏幕录制」权限",
                   "在 系统设置 → 隐私与安全性 → 屏幕录制与系统录音 中勾选 ShotMark，然后重新打开 ShotMark 再按 ⌃⇧A。")
@@ -105,6 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let screens = NSScreen.screens
         let mouseLoc = NSEvent.mouseLocation
         let target = screens.first { NSMouseInRect(mouseLoc, $0.frame, false) } ?? NSScreen.main ?? screens[0]
+        AppLog.event("capture_target", ["screen": NSStringFromRect(target.frame), "screenCount": screens.count])
         fputs("[ShotMark] 目标屏: 鼠标(\(Int(mouseLoc.x)),\(Int(mouseLoc.y))) -> \(target.frame)\n", stderr)
         Task { @MainActor in
             guard let did = Capture.displayID(for: target) else {
@@ -130,12 +153,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             do {
                 let cg = try await Capture.grab(displayID: did)
+                AppLog.event("capture_ok", ["width": cg.width, "height": cg.height, "screen": NSStringFromRect(target.frame)])
                 fputs("[ShotMark] 覆盖层: \(target.frame.size) <- 图 \(cg.width)x\(cg.height)\n", stderr)
                 NSApp.setActivationPolicy(.regular)
+                AppLog.event("activation_policy_regular")
                 presentOverlay(screen: target, image: NSImage(cgImage: cg, size: target.frame.size))
                 NSApp.activate(ignoringOtherApps: true)
+                AppLog.event("activate_after_overlay")
             } catch {
                 let nserr = error as NSError
+                AppLog.event("capture_error", ["domain": nserr.domain, "code": nserr.code, "message": nserr.localizedDescription])
                 fputs("[ShotMark] 捕获失败: \(nserr.domain) \(nserr.code) \(nserr.localizedDescription)\n", stderr)
                 if nserr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", nserr.code == -3801 {
                     alert("屏幕录制权限未生效",
@@ -157,20 +184,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = ShotView(frame: NSRect(origin: .zero, size: screen.frame.size), captured: image)
         view.delegate = self
         win.contentView = view
+        AppLog.event("overlay_before_show", ["windowNumber": win.windowNumber, "frame": NSStringFromRect(win.frame),
+                                              "level": win.level.rawValue, "canBecomeKey": win.canBecomeKey])
         win.makeKeyAndOrderFront(nil)
         overlays.append(win)
+        AppLog.event("overlay_after_show", ["windowNumber": win.windowNumber, "visible": win.isVisible,
+                                             "key": win.isKeyWindow, "firstResponder": win.firstResponder.map { String(describing: type(of: $0)) } ?? "nil",
+                                             "viewFirstResponder": win.firstResponder === view])
     }
 
     private func closeOverlays() {
+        AppLog.event("overlay_close_begin", ["count": overlays.count])
         for w in overlays { w.close() }
         overlays.removeAll()
         OCRPanelController.shared.close()   // 截图状态收起，OCR 面板跟着收（二者共存、共退）
         NSApp.setActivationPolicy(.accessory)   // 收完回到无 Dock 常驻
+        AppLog.event("overlay_close_end")
     }
 
     // MARK: - 完成动作
 
     private func copyToPasteboard(_ img: NSImage) {
+        AppLog.event("pasteboard_copy_begin", ["image": String(describing: img.size)])
         let pb = NSPasteboard.general
         pb.clearContents()
         // PNG 必须显式放：writeObjects([NSImage]) 只给 TIFF，而 UTM/SPICE 剪贴板同步、
@@ -181,6 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let tiff = img.tiffRepresentation {
             pb.setData(tiff, forType: .tiff)
         }
+        AppLog.event("pasteboard_copy_end", ["changeCount": pb.changeCount, "types": pb.types?.map { $0.rawValue } ?? []])
     }
 
     private func saveImage(_ img: NSImage, reveal: Bool = true) {
@@ -218,6 +254,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.center()
         win.makeKeyAndOrderFront(nil)
         pinnedWindows.append(win)
+    }
+
+    // MARK: - 应用事件与本地输入取证
+
+    func applicationDidBecomeActive(_ notification: Notification) { AppLog.event("app_did_become_active") }
+    func applicationDidResignActive(_ notification: Notification) { AppLog.event("app_did_resign_active") }
+    func applicationWillTerminate(_ notification: Notification) { AppLog.event("app_will_terminate") }
+
+    private func installEventMonitors() {
+        let specs: [(NSEvent.EventTypeMask, String)] = [
+            (.leftMouseDown, "local_mouse_down"), (.leftMouseUp, "local_mouse_up"),
+            (.rightMouseDown, "local_right_mouse_down"), (.keyDown, "local_key_down"),
+        ]
+        for (mask, name) in specs {
+            if let token = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { ev in
+                AppLog.event(name, ["keyCode": ev.keyCode, "clickCount": ev.clickCount,
+                                    "windowNumber": ev.windowNumber,
+                                    "location": NSStringFromPoint(ev.locationInWindow)])
+                return ev
+            }) { eventMonitors.append(token) }
+        }
+        AppLog.event("event_monitors_installed", ["count": eventMonitors.count])
     }
 
     // MARK: - 状态栏
@@ -266,6 +324,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: ShotViewDelegate {
     func shotView(_ view: ShotView, didFinish image: NSImage?, action: FinishAction?, blank: Bool = false) {
+        AppLog.event("shot_finish_received", ["action": action.map { String(describing: $0) } ?? "nil",
+                                               "hasImage": image != nil, "blank": blank, "overlayCount": overlays.count])
         if blank {
             // 白板导出：不静默出白图——toast 提示重试，现场已落盘 $TMPDIR/shotmark-last-*.png
             fputs("[ShotMark] ⚠️ 导出白板，action=\(String(describing: action))\n", stderr)
@@ -276,9 +336,15 @@ extension AppDelegate: ShotViewDelegate {
         if action != .ocr { closeOverlays() }
         guard let img = image, let action = action else { return }
         switch action {
-        case .copy: copyToPasteboard(img)
-        case .save: saveImage(img)
-        case .pin:  pinImage(img)
+        case .copy:
+            AppLog.event("finish_action", ["action": "copy"])
+            copyToPasteboard(img)
+        case .save:
+            AppLog.event("finish_action", ["action": "save"])
+            saveImage(img)
+        case .pin:
+            AppLog.event("finish_action", ["action": "pin"])
+            pinImage(img)
         case .ocr:
             // 飞书同款：立即弹「识别中…」面板，结果可查看/编辑，用户点「复制文本」才进剪贴板
             let mouse = NSEvent.mouseLocation
