@@ -7,7 +7,9 @@ final class OverlayWindow: NSWindow {
     private func logWindow(_ event: String) {
         AppLog.event(event, ["windowNumber": windowNumber, "frame": NSStringFromRect(frame),
                              "level": level.rawValue, "visible": isVisible, "key": isKeyWindow,
-                             "canBecomeKey": canBecomeKey])
+                             "canBecomeKey": canBecomeKey, "ignoresMouseEvents": ignoresMouseEvents,
+                             "contentFrame": contentView.map { NSStringFromRect($0.frame) } ?? "nil",
+                             "contentClass": contentView.map { String(describing: type(of: $0)) } ?? "nil"])
     }
     override func becomeKey() { super.becomeKey(); logWindow("window_become_key") }
     override func resignKey() { super.resignKey(); logWindow("window_resign_key") }
@@ -190,7 +192,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlays.append(win)
         AppLog.event("overlay_after_show", ["windowNumber": win.windowNumber, "visible": win.isVisible,
                                              "key": win.isKeyWindow, "firstResponder": win.firstResponder.map { String(describing: type(of: $0)) } ?? "nil",
-                                             "viewFirstResponder": win.firstResponder === view])
+                                             "viewFirstResponder": win.firstResponder === view,
+                                             "ignoresMouseEvents": win.ignoresMouseEvents,
+                                             "contentFrame": NSStringFromRect(view.frame)])
+        logWindowServer()
     }
 
     private func closeOverlays() {
@@ -269,13 +274,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]
         for (mask, name) in specs {
             if let token = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { ev in
-                AppLog.event(name, ["keyCode": ev.keyCode, "clickCount": ev.clickCount,
-                                    "windowNumber": ev.windowNumber,
-                                    "location": NSStringFromPoint(ev.locationInWindow)])
+                // 只读本事件类型合法字段：keyCode/clickCount 混读会抛 NSException，反而吞掉原事件
+                var f: [String: Any] = ["windowNumber": ev.windowNumber]
+                if ev.type == .keyDown {
+                    f["keyCode"] = ev.keyCode
+                    f["modifiers"] = ev.modifierFlags.rawValue
+                } else {
+                    f["clickCount"] = ev.clickCount
+                    f["location"] = NSStringFromPoint(ev.locationInWindow)
+                }
+                AppLog.event(name, f)
                 return ev
             }) { eventMonitors.append(token) }
         }
+        // 全局只读鼠标对照：即使前台是 Chrome，也能确认系统是否收到了这次点击
+        for (mask, name) in [(NSEvent.EventTypeMask.leftMouseDown, "global_mouse_down"),
+                             (.leftMouseUp, "global_mouse_up")] {
+            if let token = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { ev in
+                AppLog.event(name, ["windowNumber": ev.windowNumber, "clickCount": ev.clickCount])
+            }) { eventMonitors.append(token) }
+        }
         AppLog.event("event_monitors_installed", ["count": eventMonitors.count])
+    }
+
+    private func logWindowServer() {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let ws = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let mine = ws.filter { ($0["kCGWindowOwnerPID"] as? Int) == Int(pid) }.map { w in
+            [
+                "number": w["kCGWindowNumber"] as? Int ?? -1,
+                "layer": w["kCGWindowLayer"] as? Int ?? -1,
+                "alpha": w["kCGWindowAlpha"] as? Double ?? -1,
+                "bounds": String(describing: w["kCGWindowBounds"] ?? [:]),
+            ]
+        }
+        AppLog.event("window_server_state", ["windows": mine])
     }
 
     // MARK: - 状态栏
