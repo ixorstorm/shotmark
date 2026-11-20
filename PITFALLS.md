@@ -134,3 +134,16 @@
 - 全局 gitconfig 有 `url.https://ghfast.top/https://github.com/.insteadof` → 推 GitHub 时凭证助手匹配不到 ghfast.top → 挂起
 - 修法：`GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git push`（osxkeychain 在系统级配置不受影响）
 - 镜像发布：`git subtree split --prefix=work/shotmark` 保留真实历史（见 `scripts/publish.sh`）
+
+## 八、日志与事件监听
+
+### 24. 本地事件监控混读字段会把鼠标事件吞掉（窗口看得见但点不动）
+- **现象**：先点勾/空格无反应，补日志后连选区都画不出来
+- **日志证据**：`hotkey_carbon_callback` → `capture_sck_ok` → `overlay_after_show(visible=true)` → `window_become_key` 全成功，`ShotView` 也已是第一响应者；但 `local_mouse_down` / `shotview_mouse_down` 始终为空，说明断在事件投递，不在抓屏或导出
+- **定位结论（唯一行为变更 + 恢复验证）**：本地 monitor 对所有事件同时读 `keyCode` 与 `clickCount`。这些属性有事件类型域，键鼠混读会抛 NSException/吞掉原事件；改成按 `event.type` 分读字段后恢复
+- **铁律**：`keyCode` 只在键盘事件读，`clickCount/locationInWindow` 只在鼠标事件读；本地 monitor 必须原样 `return ev`，日志不得改变事件投递
+- **排障对照**：加只读全局鼠标 monitor，区分「系统收到点击但 App 没收到」与「用户没点到窗口」；同步 JSONL 落盘，防崩溃丢最后一拍
+
+### 25. `NSApp` 初始化前读它会 SIGTRAP
+- 首版 `AppLog.launch()` 放在 `NSApplication.shared` 之前，读 `NSApp.activationPolicy` 直接 Trace/BPT trap
+- 铁律：任何 `NSApp` / 窗口状态读取都必须在 `let app = NSApplication.shared` 之后
